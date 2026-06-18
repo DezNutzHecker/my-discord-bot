@@ -734,3 +734,34 @@ function deobfuscate(code, engine = 'auto') {
     const before = current;
     phase(`pass_${p+1}`, () => { current = runTextPasses(current); });
     if (current === before) { detectedPatterns.push(`converged_at_pass:${p+1}
+    `); break; }
+  }
+
+  phase('beautify', () => { current = beautify(current); });
+
+  let valid = false;
+  phase('validate', () => {
+    try { luaparse.parse(current, { luaVersion: '5.1' }); valid = true; } catch {}
+  });
+  if (!valid) recommendations.push('Output failed parse validation — manual review needed.');
+
+  let confidence = handlerResult.confidence;
+  if (valid) confidence = Math.min(1, confidence + 0.1);
+
+  return finalize(current, fingerprint.name, detectedPatterns, recommendations, phases, t0, confidence, valid);
+}
+
+function finalize(code, method, patterns, recs, phases, t0, confidence, valid = null) {
+  return {
+    deobfuscated: code,
+    method,
+    confidence: Math.max(0, Math.min(1, confidence)),
+    complexity: estimateComplexity(code),
+    codeQuality: assessQuality(code),
+    detectedPatterns: patterns,
+    recommendations: recs,
+    stats: { totalTime: Date.now() - t0, phases, validOutput: valid },
+  };
+}
+
+module.exports = { deobfuscate };
