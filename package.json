@@ -1,19 +1,14 @@
 {
-  "name": "lua-deobfuscator-bot",
-  "version": "2.0.0",
-  "description": "Discord bot for deobfuscating Roblox Lua scripts with 50+ engine support",
+  "name": "lua-bot",
+  "version": "1.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "register": "node register-commands.js"
+    "register": "node index.js register"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
-    "lru-cache": "^10.2.0",
-    "luaparse": "^0.3.1",
     "dotenv": "^16.4.5"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": ">=18" }
 }
