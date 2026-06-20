@@ -20,9 +20,11 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
 const MAX_BYTES = 8014 * 1024;
 const MAX_INLINE = 1900;
 const MAX_OUTPUT_FILE = 24 * 1024 * 1024;
-const SANDBOX_TIMEOUT_MS = 6000_000;
+const SANDBOX_TIMEOUT_MS = 600_000;
 const CACHE_MAX = 200;
 const CACHE_TTL_MS = 30 * 60 * 1000;
+
+const LUA_KEYWORDS = new Set(['and','break','do','else','elseif','end','false','for','function','goto','if','in','local','nil','not','or','repeat','return','then','true','until','while']);
 
 // ==================== CACHE ====================
 
@@ -99,7 +101,7 @@ function printableScore(s) {
 }
 
 function looksLikeLua(s) {
-  const LUA_KEYWORDS = new Set(['and','break','do','else','elseif','end','false','for','function','goto','if','in','local','nil','not','or','repeat','return','then','true','until','while']);
+  const kw = /\b(local|function|end|if|then|else|return|for|while|do|repeat|until|elseif)\b/g;
   const matches = s.match(kw);
   return matches && matches.length >= 2;
 }
@@ -131,7 +133,6 @@ function decodeStringChar(code) {
   let prev;
   do {
     prev = code;
-    // Match string.char with only numeric args (skip nested expressions)
     code = code.replace(/string\.char\s*\(\s*((?:-?\d+\s*,\s*)*-?\d+)\s*\)/g, (m, args) => {
       const parts = args.split(',').map(s => s.trim());
       try {
@@ -168,16 +169,13 @@ function bruteXorStrings(code) {
   let count = 0;
   const result = walkStrings(code, b => {
     if (b.length < 16 || b.length > 50000) return b;
-    // Skip anything already printable - don't risk wrecking valid strings
     if (printableScore(b) > 0.85) return b;
-    // Skip anything that has any printable letter sequence - likely valid plain text
     if (/[a-zA-Z]{4,}/.test(b) && printableScore(b) > 0.7) return b;
     let best = null;
     for (let k = 1; k < 256; k++) {
       let decoded = '';
       for (let i = 0; i < b.length; i++) decoded += String.fromCharCode(b.charCodeAt(i) ^ k);
       const score = printableScore(decoded);
-      // Require both high printability AND Lua-like content
       if (score > 0.97 && looksLikeLua(decoded)) {
         if (!best || score > best.score) best = { decoded, score };
       }
@@ -187,6 +185,7 @@ function bruteXorStrings(code) {
   });
   return { code: result, count };
 }
+
 function bruteCaesarStrings(code) {
   let count = 0;
   const result = walkStrings(code, b => {
@@ -349,7 +348,6 @@ function inlineTrivialFunctions(code) {
 function unwrapLoadstrings(code, max = 12) {
   let layers = 0;
   for (let i = 0; i < max; i++) {
-    // Match loadstring("..." or loadstring(varname) followed by ()
     const stringArg = code.match(/load(?:string)?\s*\(\s*(["'])((?:\\.|(?!\1)[^\\])+)\1\s*\)\s*\(\s*\)/);
     if (stringArg) {
       const inner = decodeUnicode(decodeHex(decodeDecimal(stringArg[2])));
@@ -358,7 +356,6 @@ function unwrapLoadstrings(code, max = 12) {
       layers++;
       continue;
     }
-    // Match loadstring(variable)() — try to resolve the variable
     const varArg = code.match(/load(?:string)?\s*\(\s*(\w+)\s*\)\s*\(\s*\)/);
     if (varArg) {
       const varName = varArg[1];
@@ -379,13 +376,24 @@ function unwrapLoadstrings(code, max = 12) {
 }
 
 function renameUglyIdentifiers(code) {
+  const existing = new Set();
+  const idRe = /\b([a-zA-Z_]\w*)\b/g;
+  let im;
+  while ((im = idRe.exec(code)) !== null) existing.add(im[1]);
+
   const seen = new Map();
   let counter = 0;
   const ugly = /\b(_0x[0-9a-fA-F]{4,}|_+[ilIO10]{4,}_*|[A-Z_]{12,})\b/g;
   let m;
   while ((m = ugly.exec(code)) !== null) {
     const name = m[1];
-    if (!seen.has(name)) seen.set(name, `v${++counter}`);
+    if (LUA_KEYWORDS.has(name)) continue;
+    if (!seen.has(name)) {
+      let candidate;
+      do { candidate = `v${++counter}`; } while (existing.has(candidate));
+      seen.set(name, candidate);
+      existing.add(candidate);
+    }
   }
   const sorted = [...seen.keys()].sort((a, b) => b.length - a.length);
   for (const k of sorted) {
@@ -414,7 +422,6 @@ function beautify(code) {
       if (c === inStr) { tokens.push({ s: true, v: buf }); buf = ''; inStr = null; }
       i++; continue;
     }
-    // Long-bracket strings [[ ... ]]
     if (c === '[' && code[i+1] === '[') {
       if (buf) { tokens.push({ s: false, v: buf }); buf = ''; }
       const end = code.indexOf(']]', i + 2);
@@ -432,11 +439,8 @@ function beautify(code) {
     if (t.s) joined += t.v;
     else {
       let v = t.v;
-      // Only split on `;` if it's clearly a statement separator (not in a for-loop header etc)
       v = v.replace(/;\s*(?=[a-zA-Z_])/g, '\n');
-      // Add newline AFTER then/do only if followed by non-whitespace, non-newline
       v = v.replace(/\b(then|do)\b(?=[ \t]+[a-zA-Z_])/g, '$1\n');
-      // Add newline BEFORE end/else/elseif/until when preceded by content
       v = v.replace(/([^\s])\s+\b(end|else|elseif|until)\b/g, '$1\n$2');
       joined += v;
     }
@@ -455,40 +459,11 @@ function beautify(code) {
   return result.join('\n') + '\n';
 }
 
-  const lines = joined.split('\n').map(l => l.trim()).filter(Boolean);
-  const result = [];
-  let indent = 0;
-  for (const l of lines) {
-    if (/^(end|else|elseif|until)\b/.test(l)) indent = Math.max(0, indent - 1);
-    result.push('  '.repeat(indent) + l);
-    if (/\b(then|do|function[^)]*\)|repeat|else)\s*$/.test(l)) indent++;
-    if (/^(else|elseif)\b/.test(l)) indent++;
-  }
-  return result.join('\n') + '\n';
-}
 // ==================== WEAREDEVS UNPACKER ====================
 
 function isWeAreDevs(code) {
   return /wearedevs\.net\/obfuscator/i.test(code) ||
          /--\[\[\s*v\d+\.\d+\.\d+\s+https?:\/\/wearedevs/i.test(code);
-}
-
-function extractWadConstantTable(code) {
-  // Find `local o = { ... }` near the start
-  const m = code.match(/local\s+(\w+)\s*=\s*\{([\s\S]*?)\}\s*(?:[,;]|local|for|while|repeat|return|end)/);
-  if (!m) return null;
-  const name = m[1];
-  const body = m[2];
-
-  // WAD strings are separated by `;` or `,`
-  // Each string is "\NNN\NNN\NNN..." form
-  const strings = [];
-  const re = /"((?:\\\d{1,3}|\\x[0-9a-fA-F]{2}|\\.|[^"\\])*)"/g;
-  let sm;
-  while ((sm = re.exec(body)) !== null) {
-    strings.push(decodeAllEscapesInString(sm[1]));
-  }
-  return { name, strings, raw: body };
 }
 
 function decodeAllEscapesInString(s) {
@@ -498,7 +473,6 @@ function decodeAllEscapesInString(s) {
     const c = s[i];
     if (c === '\\' && i + 1 < s.length) {
       const n = s[i+1];
-      // \NNN decimal
       if (/\d/.test(n)) {
         let num = '';
         let j = i + 1;
@@ -508,7 +482,6 @@ function decodeAllEscapesInString(s) {
         const code = parseInt(num, 10);
         if (code <= 255) { out += String.fromCharCode(code); i = j; continue; }
       }
-      // \xNN hex
       if (n === 'x' && i + 3 < s.length) {
         const h = s.slice(i+2, i+4);
         if (/^[0-9a-fA-F]{2}$/.test(h)) {
@@ -516,7 +489,6 @@ function decodeAllEscapesInString(s) {
           i += 4; continue;
         }
       }
-      // Standard escapes
       if (n === 'n') { out += '\n'; i += 2; continue; }
       if (n === 't') { out += '\t'; i += 2; continue; }
       if (n === 'r') { out += '\r'; i += 2; continue; }
@@ -528,15 +500,18 @@ function decodeAllEscapesInString(s) {
   return out;
 }
 
-function tryBase64Decode(s) {
-  // Standard b64 first
-  if (/^[A-Za-z0-9+/]+=*$/.test(s) && s.length % 4 === 0) {
-    try {
-      const decoded = Buffer.from(s, 'base64').toString('utf-8');
-      if (printableScore(decoded) > 0.85) return decoded;
-    } catch {}
+function extractWadConstantTable(code) {
+  const m = code.match(/local\s+(\w+)\s*=\s*\{([\s\S]*?)\}\s*(?:[,;]|local|for|while|repeat|return|end)/);
+  if (!m) return null;
+  const name = m[1];
+  const body = m[2];
+  const strings = [];
+  const re = /"((?:\\\d{1,3}|\\x[0-9a-fA-F]{2}|\\.|[^"\\])*)"/g;
+  let sm;
+  while ((sm = re.exec(body)) !== null) {
+    strings.push(decodeAllEscapesInString(sm[1]));
   }
-  return null;
+  return { name, strings, raw: body };
 }
 
 function unpackWeAreDevs(code) {
@@ -563,31 +538,25 @@ function unpackWeAreDevs(code) {
   result.stats.totalStrings = table.strings.length;
   result.strings = table.strings;
 
-  // Decode every string with every method we know, keep what works
   const decoded = [];
   let b64Count = 0;
   for (const s of table.strings) {
     const attempts = [];
-    // Standard base64
     if (/^[A-Za-z0-9+/]+=*$/.test(s) && s.length % 4 === 0) {
       try {
         const d = Buffer.from(s, 'base64').toString('utf-8');
         if (printableScore(d) > 0.85) { attempts.push({ method: 'b64', value: d }); b64Count++; }
       } catch {}
     }
-    // Raw printable
     if (printableScore(s) > 0.85) attempts.push({ method: 'raw', value: s });
     decoded.push(attempts[0] || { method: 'unknown', value: s });
   }
   result.stats.base64Decoded = b64Count;
   result.stats.decodedStrings = decoded.filter(d => d.method !== 'unknown').length;
 
-  // WAD format note - the interpreter at the bottom uses these chunks
-  // For now, dump useful chunks the user can inspect
   const useful = decoded.filter(d => d.method !== 'unknown' && d.value.length >= 4);
 
   if (useful.length > 10) {
-    // Try joining b64-decoded chunks - sometimes works for simpler WAD variants
     const joined = useful.map(d => d.value).join('');
     if (looksLikeLua(joined)) {
       result.decoded = beautify(stripComments(joined));
@@ -596,54 +565,11 @@ function unpackWeAreDevs(code) {
     }
   }
 
-  // Couldn't reconstruct - return useful info instead of fake success
   result.error = `Unpacker could not auto-reconstruct payload. Custom alphabet likely in use. Returning ${useful.length} decoded chunks for analysis.`;
   result.strings = useful.map(d => `[${d.method}] ${d.value}`);
   return result;
 }
 
-  // WAD typically concatenates all strings into one payload
-  // Strategy 1: join all decoded strings if most look like b64
-  // Strategy 2: join raw strings
-  // Strategy 3: alternate strategies based on what looks like Lua
-
-  const candidates = [];
-
-  // Joined raw (most common WAD pattern - the table IS the payload chunks)
-  candidates.push({ name: 'joined-raw', code: table.strings.join('') });
-
-  // Joined base64-decoded (when each entry is a b64 chunk)
-  if (b64Count > table.strings.length * 0.5) {
-    candidates.push({
-      name: 'joined-base64',
-      code: b64Decoded.filter(x => x).join(''),
-    });
-  }
-
-  // Reverse-join (some WAD variants reverse the order)
-  candidates.push({ name: 'reversed-raw', code: [...table.strings].reverse().join('') });
-
-  // Pick the candidate that looks most like Lua
-  let best = null;
-  for (const c of candidates) {
-    if (!c.code || c.code.length < 20) continue;
-    const luaScore = (c.code.match(/\b(local|function|end|return|if|then|else|for|while|do)\b/g) || []).length;
-    if (!best || luaScore > best.luaScore) {
-      best = { ...c, luaScore };
-    }
-  }
-
-  if (best && best.luaScore >= 3) {
-    result.joinedPayload = best.code;
-    result.stats.payloadSize = best.code.length;
-    result.decoded = beautify(stripComments(best.code));
-  } else {
-    // Couldn't reconstruct - dump strings for manual analysis
-    result.error = 'Could not reconstruct a Lua payload from table strings. See raw strings below.';
-  }
-
-  return result;
-}
 // ==================== FINGERPRINTING ====================
 
 function detectObfuscator(code) {
@@ -665,7 +591,6 @@ function detectObfuscator(code) {
   if ((code.match(/_0x[0-9a-f]{4,}/gi) || []).length > 10) hints.push('hex-mangled identifiers');
   return hints;
 }
-
 // ==================== SANDBOX ====================
 
 function sandboxExecute(code) {
@@ -676,7 +601,6 @@ function sandboxExecute(code) {
   const L = lauxlib.luaL_newstate();
   lualib.luaL_openlibs(L);
 
-  // Hook loadstring/load: capture payload AND return a fake function so chained () doesn't blow up
   const captureLoad = (L) => {
     if (lua.lua_isstring(L, 1)) {
       const s = lua.lua_tojsstring(L, 1);
@@ -740,70 +664,13 @@ function sandboxExecute(code) {
   }
 }
 
-  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('loadstring'));
-  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('load'));
-
-  // Block dangerous stuff
-  const block = ['os', 'io', 'require', 'dofile', 'loadfile', 'package'];
-  for (const name of block) {
-    lua.lua_pushnil(L); lua.lua_setglobal(L, to_luastring(name));
-  }
-
-  // Capture print
-  lua.lua_pushjsfunction(L, (L) => {
-    const n = lua.lua_gettop(L);
-    const parts = [];
-    for (let i = 1; i <= n; i++) {
-      if (lua.lua_isstring(L, i)) parts.push(lua.lua_tojsstring(L, i));
-      else parts.push(String(lua.lua_tonumber(L, i)));
-    }
-    captured.push({ type: 'print', value: parts.join('\t') });
-    return 0;
-  });
-  lua.lua_setglobal(L, to_luastring('print'));
-
-  // Fake game env for Roblox scripts
-  const fakeGame = `
-    local mt = {__index = function(t,k) return setmetatable({}, getmetatable(t)) end,
-                __call = function(t, ...) return setmetatable({}, getmetatable(t)) end,
-                __newindex = function(t,k,v) end}
-    game = setmetatable({}, mt)
-    workspace = setmetatable({}, mt)
-    script = setmetatable({}, mt)
-    wait = function() end
-    spawn = function(f) end
-    delay = function(t,f) end
-    tick = function() return 0 end
-    Instance = setmetatable({new = function() return setmetatable({}, mt) end}, mt)
-  `;
-  lauxlib.luaL_dostring(L, to_luastring(fakeGame));
-
-  // Time-limit via instruction hook
-  const start = Date.now();
-  lua.lua_sethook(L, () => {
-    if (Date.now() - start > SANDBOX_TIMEOUT_MS) {
-      lauxlib.luaL_error(L, to_luastring('sandbox timeout'));
-    }
-  }, lua.LUA_MASKCOUNT, 10000);
-
-  try {
-    const status = lauxlib.luaL_dostring(L, to_luastring(code));
-    if (status !== lua.LUA_OK) {
-      const err = lua.lua_tojsstring(L, -1) || 'unknown error';
-      return { available: true, captured, error: err };
-    }
-    return { available: true, captured, error: null };
-  } catch (e) {
-    return { available: true, captured, error: e.message };
-  }
-}
 // ==================== PIPELINE ====================
 
 function decodeFull(code) {
   const stats = {
     originalSize: code.length, passes: 0, layers: 0,
     xorDecoded: 0, caesarDecoded: 0, base64Decoded: 0,
-    reversedDecoded: 0, renamed: 0,
+    reversedDecoded: 0, renamed: 0, finalSize: 0,
   };
 
   code = stripComments(code);
@@ -839,38 +706,19 @@ function decodeFull(code) {
   const revResult = tryReverseStrings(code);
   code = revResult.code; stats.reversedDecoded = revResult.count;
 
-  // One more sweep after brute decoders
   code = foldConcat(code);
   code = resolveConstantTables(code);
   const unwrap2 = unwrapLoadstrings(code);
   code = unwrap2.code; stats.layers += unwrap2.layers;
 
- function renameUglyIdentifiers(code) {
-  // First, find all existing identifiers so we don't collide
-  const existing = new Set();
-  const idRe = /\b([a-zA-Z_]\w*)\b/g;
-  let im;
-  while ((im = idRe.exec(code)) !== null) existing.add(im[1]);
+  const rename = renameUglyIdentifiers(code);
+  code = rename.code; stats.renamed = rename.renamed;
 
-  const seen = new Map();
-  let counter = 0;
-  const ugly = /\b(_0x[0-9a-fA-F]{4,}|_+[ilIO10]{4,}_*|[A-Z_]{12,})\b/g;
-  let m;
-  while ((m = ugly.exec(code)) !== null) {
-    const name = m[1];
-    if (LUA_KEYWORDS && LUA_KEYWORDS.has(name)) continue;
-    if (!seen.has(name)) {
-      let candidate;
-      do { candidate = `v${++counter}`; } while (existing.has(candidate));
-      seen.set(name, candidate);
-      existing.add(candidate);
-    }
-  }
-  const sorted = [...seen.keys()].sort((a, b) => b.length - a.length);
-  for (const k of sorted) {
-    code = code.replace(new RegExp(`\\b${escRe(k)}\\b`, 'g'), seen.get(k));
-  }
-  return { code, renamed: seen.size };
+  code = removeDeadCode(code);
+  code = beautify(code);
+
+  stats.finalSize = code.length;
+  return { code, stats };
 }
 
 // ==================== EXTRACTORS ====================
@@ -1006,6 +854,7 @@ async function startBot() {
 
       const fingerprint = src.code.length + ':' + src.code.slice(0, 512) + ':' + src.code.slice(-512);
       const key = hashOf(cmd + ':' + fingerprint);
+      const cached = cache.get(key);
 
       if (cmd === 'beautify') {
         let out;
