@@ -418,7 +418,156 @@ function beautify(code) {
   }
   return result.join('\n') + '\n';
 }
+// ==================== WEAREDEVS UNPACKER ====================
 
+function isWeAreDevs(code) {
+  return /wearedevs\.net\/obfuscator/i.test(code) ||
+         /--\[\[\s*v\d+\.\d+\.\d+\s+https?:\/\/wearedevs/i.test(code);
+}
+
+function extractWadConstantTable(code) {
+  // Find `local o = { ... }` near the start
+  const m = code.match(/local\s+(\w+)\s*=\s*\{([\s\S]*?)\}\s*(?:[,;]|local|for|while|repeat|return|end)/);
+  if (!m) return null;
+  const name = m[1];
+  const body = m[2];
+
+  // WAD strings are separated by `;` or `,`
+  // Each string is "\NNN\NNN\NNN..." form
+  const strings = [];
+  const re = /"((?:\\\d{1,3}|\\x[0-9a-fA-F]{2}|\\.|[^"\\])*)"/g;
+  let sm;
+  while ((sm = re.exec(body)) !== null) {
+    strings.push(decodeAllEscapesInString(sm[1]));
+  }
+  return { name, strings, raw: body };
+}
+
+function decodeAllEscapesInString(s) {
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < s.length) {
+      const n = s[i+1];
+      // \NNN decimal
+      if (/\d/.test(n)) {
+        let num = '';
+        let j = i + 1;
+        while (j < s.length && num.length < 3 && /\d/.test(s[j])) {
+          num += s[j]; j++;
+        }
+        const code = parseInt(num, 10);
+        if (code <= 255) { out += String.fromCharCode(code); i = j; continue; }
+      }
+      // \xNN hex
+      if (n === 'x' && i + 3 < s.length) {
+        const h = s.slice(i+2, i+4);
+        if (/^[0-9a-fA-F]{2}$/.test(h)) {
+          out += String.fromCharCode(parseInt(h, 16));
+          i += 4; continue;
+        }
+      }
+      // Standard escapes
+      if (n === 'n') { out += '\n'; i += 2; continue; }
+      if (n === 't') { out += '\t'; i += 2; continue; }
+      if (n === 'r') { out += '\r'; i += 2; continue; }
+      if (n === '\\' || n === '"' || n === "'") { out += n; i += 2; continue; }
+      out += n; i += 2; continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
+function tryBase64Decode(s) {
+  // Standard b64 first
+  if (/^[A-Za-z0-9+/]+=*$/.test(s) && s.length % 4 === 0) {
+    try {
+      const decoded = Buffer.from(s, 'base64').toString('utf-8');
+      if (printableScore(decoded) > 0.85) return decoded;
+    } catch {}
+  }
+  return null;
+}
+
+function unpackWeAreDevs(code) {
+  const result = {
+    detected: false,
+    decoded: null,
+    strings: [],
+    joinedPayload: null,
+    error: null,
+    stats: { totalStrings: 0, base64Decoded: 0, payloadSize: 0 },
+  };
+
+  if (!isWeAreDevs(code)) {
+    result.error = 'Not a WeAreDevs script (no v1.0.0 header found)';
+    return result;
+  }
+  result.detected = true;
+
+  const table = extractWadConstantTable(code);
+  if (!table) {
+    result.error = 'Could not find constant table';
+    return result;
+  }
+
+  result.stats.totalStrings = table.strings.length;
+  result.strings = table.strings;
+
+  // Try base64 on each string
+  let b64Count = 0;
+  const b64Decoded = [];
+  for (const s of table.strings) {
+    const dec = tryBase64Decode(s);
+    if (dec) { b64Decoded.push(dec); b64Count++; }
+    else b64Decoded.push(null);
+  }
+  result.stats.base64Decoded = b64Count;
+
+  // WAD typically concatenates all strings into one payload
+  // Strategy 1: join all decoded strings if most look like b64
+  // Strategy 2: join raw strings
+  // Strategy 3: alternate strategies based on what looks like Lua
+
+  const candidates = [];
+
+  // Joined raw (most common WAD pattern - the table IS the payload chunks)
+  candidates.push({ name: 'joined-raw', code: table.strings.join('') });
+
+  // Joined base64-decoded (when each entry is a b64 chunk)
+  if (b64Count > table.strings.length * 0.5) {
+    candidates.push({
+      name: 'joined-base64',
+      code: b64Decoded.filter(x => x).join(''),
+    });
+  }
+
+  // Reverse-join (some WAD variants reverse the order)
+  candidates.push({ name: 'reversed-raw', code: [...table.strings].reverse().join('') });
+
+  // Pick the candidate that looks most like Lua
+  let best = null;
+  for (const c of candidates) {
+    if (!c.code || c.code.length < 20) continue;
+    const luaScore = (c.code.match(/\b(local|function|end|return|if|then|else|for|while|do)\b/g) || []).length;
+    if (!best || luaScore > best.luaScore) {
+      best = { ...c, luaScore };
+    }
+  }
+
+  if (best && best.luaScore >= 3) {
+    result.joinedPayload = best.code;
+    result.stats.payloadSize = best.code.length;
+    result.decoded = beautify(stripComments(best.code));
+  } else {
+    // Couldn't reconstruct - dump strings for manual analysis
+    result.error = 'Could not reconstruct a Lua payload from table strings. See raw strings below.';
+  }
+
+  return result;
+}
 // ==================== FINGERPRINTING ====================
 
 function detectObfuscator(code) {
