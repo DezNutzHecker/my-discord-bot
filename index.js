@@ -17,19 +17,16 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
   process.exit(1);
 }
 
-const MAX_BYTES = 8 * 1024 * 1024;
+const MAX_BYTES = 8 * 1024 * 1024;          // 8 MB input cap (fixed typo)
 const MAX_INLINE = 1900;
 const MAX_OUTPUT_FILE = 24 * 1024 * 1024;
-const SANDBOX_TIMEOUT_MS = 8_000;
-const PIPELINE_TIMEOUT_MS = 30_000;
+const SANDBOX_TIMEOUT_MS = 8_000;           // 8s wall clock — Discord interaction safety
+const SANDBOX_HOOK_COUNT = 50_000;          // check clock far more often
+const PIPELINE_BUDGET_MS = 20_000;          // global pipeline time budget
 const CACHE_MAX = 200;
 const CACHE_TTL_MS = 30 * 60 * 1000;
-const MAX_PIPELINE_ITER = 25;
 
-const LUA_KEYWORDS = new Set([
-  'and','break','do','else','elseif','end','false','for','function','goto',
-  'if','in','local','nil','not','or','repeat','return','then','true','until','while',
-]);
+const LUA_KEYWORDS = new Set(['and','break','do','else','elseif','end','false','for','function','goto','if','in','local','nil','not','or','repeat','return','then','true','until','while']);
 
 // ==================== CACHE ====================
 
@@ -52,241 +49,109 @@ class LRU {
 const cache = new LRU(CACHE_MAX, CACHE_TTL_MS);
 const hashOf = s => crypto.createHash('sha256').update(s).digest('hex');
 
-// ==================== LEXER (proper Lua tokenizer) ====================
-//
-// Replaces regex-based string handling. Handles:
-//   - "..." and '...' with all escapes
-//   - [[...]] and [=[...]=] long strings
-//   - -- comments and --[[...]] long comments
-//   - numbers (hex, float, exponent)
-//   - identifiers, keywords, operators, punctuation
-//
-// This is the foundation that makes everything else reliable.
-
-const TOK = Object.freeze({
-  STR: 'str', LSTR: 'lstr', NUM: 'num', ID: 'id', KW: 'kw',
-  OP: 'op', PUNC: 'punc', COMMENT: 'comment', LCOMMENT: 'lcomment',
-  WS: 'ws', NL: 'nl', EOF: 'eof',
-});
-
-function lex(src) {
-  const tokens = [];
-  let i = 0;
-  const n = src.length;
-
-  const peek = (o = 0) => src[i + o];
-  const startsWith = s => src.startsWith(s, i);
-
-  while (i < n) {
-    const c = src[i];
-
-    // newline
-    if (c === '\n') { tokens.push({ t: TOK.NL, v: '\n', p: i }); i++; continue; }
-
-    // whitespace
-    if (c === ' ' || c === '\t' || c === '\r') {
-      let j = i;
-      while (j < n && (src[j] === ' ' || src[j] === '\t' || src[j] === '\r')) j++;
-      tokens.push({ t: TOK.WS, v: src.slice(i, j), p: i });
-      i = j; continue;
-    }
-
-    // long bracket open: [, [=*[
-    if (c === '[') {
-      let eq = 0, j = i + 1;
-      while (j < n && src[j] === '=') { eq++; j++; }
-      if (src[j] === '[') {
-        const closer = ']' + '='.repeat(eq) + ']';
-        const end = src.indexOf(closer, j + 1);
-        const stop = end === -1 ? n : end + closer.length;
-        tokens.push({ t: TOK.LSTR, v: src.slice(i, stop), eq, body: src.slice(j + 1, end === -1 ? n : end), p: i });
-        i = stop; continue;
-      }
-      tokens.push({ t: TOK.PUNC, v: '[', p: i }); i++; continue;
-    }
-
-    // comments
-    if (c === '-' && peek(1) === '-') {
-      // long comment?
-      if (src[i+2] === '[') {
-        let eq = 0, j = i + 3;
-        while (j < n && src[j] === '=') { eq++; j++; }
-        if (src[j] === '[') {
-          const closer = ']' + '='.repeat(eq) + ']';
-          const end = src.indexOf(closer, j + 1);
-          const stop = end === -1 ? n : end + closer.length;
-          tokens.push({ t: TOK.LCOMMENT, v: src.slice(i, stop), p: i });
-          i = stop; continue;
-        }
-      }
-      let j = i;
-      while (j < n && src[j] !== '\n') j++;
-      tokens.push({ t: TOK.COMMENT, v: src.slice(i, j), p: i });
-      i = j; continue;
-    }
-
-    // short strings
-    if (c === '"' || c === "'") {
-      const quote = c;
-      let j = i + 1;
-      let body = '';
-      while (j < n) {
-        const ch = src[j];
-        if (ch === '\\' && j + 1 < n) { body += ch + src[j+1]; j += 2; continue; }
-        if (ch === quote) { j++; break; }
-        if (ch === '\n') break; // unterminated, recover
-        body += ch; j++;
-      }
-      tokens.push({ t: TOK.STR, v: src.slice(i, j), q: quote, body, p: i });
-      i = j; continue;
-    }
-
-    // numbers
-    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(peek(1)))) {
-      let j = i;
-      if (c === '0' && (peek(1) === 'x' || peek(1) === 'X')) {
-        j += 2;
-        while (j < n && /[0-9a-fA-F.]/.test(src[j])) j++;
-        if (src[j] === 'p' || src[j] === 'P') {
-          j++; if (src[j] === '+' || src[j] === '-') j++;
-          while (j < n && /[0-9]/.test(src[j])) j++;
-        }
-      } else {
-        while (j < n && /[0-9.]/.test(src[j])) j++;
-        if (src[j] === 'e' || src[j] === 'E') {
-          j++; if (src[j] === '+' || src[j] === '-') j++;
-          while (j < n && /[0-9]/.test(src[j])) j++;
-        }
-      }
-      tokens.push({ t: TOK.NUM, v: src.slice(i, j), p: i });
-      i = j; continue;
-    }
-
-    // identifier or keyword
-    if (/[A-Za-z_]/.test(c)) {
-      let j = i;
-      while (j < n && /[A-Za-z0-9_]/.test(src[j])) j++;
-      const v = src.slice(i, j);
-      tokens.push({ t: LUA_KEYWORDS.has(v) ? TOK.KW : TOK.ID, v, p: i });
-      i = j; continue;
-    }
-
-    // multi-char operators
-    const three = src.slice(i, i+3);
-    if (three === '...' || three === '..=' || three === '>>=' || three === '<<=') {
-      tokens.push({ t: TOK.OP, v: three, p: i }); i += 3; continue;
-    }
-    const two = src.slice(i, i+2);
-    if (['==','~=','<=','>=','::','..','->','<<','>>','+=','-=','*=','/=','%=','^=','//'].includes(two)) {
-      tokens.push({ t: TOK.OP, v: two, p: i }); i += 2; continue;
-    }
-
-    // single char punc/op
-    if ('+-*/%^#<>=~&|'.includes(c)) { tokens.push({ t: TOK.OP, v: c, p: i }); i++; continue; }
-    if ('(){}[];,.:'.includes(c))   { tokens.push({ t: TOK.PUNC, v: c, p: i }); i++; continue; }
-
-    // unknown byte — keep as-is
-    tokens.push({ t: TOK.PUNC, v: c, p: i }); i++;
-  }
-
-  tokens.push({ t: TOK.EOF, v: '', p: n });
-  return tokens;
+class Deadline {
+  constructor(ms) { this.end = Date.now() + ms; }
+  expired() { return Date.now() > this.end; }
 }
 
-function rebuild(tokens) {
+// ==================== HELPERS ====================
+
+// Zero-pad decimal escapes when the next char is a digit so "\7" + "1" never becomes "\71".
+function escapeLua(s) {
   let out = '';
-  for (const t of tokens) {
-    if (t.t === TOK.EOF) continue;
-    if (t.t === TOK.STR) out += (t.q || '"') + t.body + (t.body.endsWith('\\') ? '' : '') + (t.q || '"');
-    else out += t.v;
-  }
-  return out;
-}
-
-function makeStr(body, quote = '"') {
-  const q = quote;
-  const escaped = body
-    .replace(/\\/g, '\\\\')
-    .replace(new RegExp(q, 'g'), '\\' + q)
-    .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, c => '\\' + c.charCodeAt(0));
-  return { t: TOK.STR, v: q + escaped + q, q, body: escaped, p: 0 };
-}
-
-function decodeStrEscapes(body) {
-  let out = '', i = 0;
-  while (i < body.length) {
-    const c = body[i];
-    if (c !== '\\') { out += c; i++; continue; }
-    const n = body[i+1];
-    if (n === undefined) { out += c; i++; continue; }
-    if (n === 'x' && /^[0-9a-fA-F]{2}$/.test(body.slice(i+2, i+4))) {
-      out += String.fromCharCode(parseInt(body.slice(i+2, i+4), 16)); i += 4; continue;
-    }
-    if (n === 'u' && body[i+2] === '{') {
-      const end = body.indexOf('}', i+3);
-      if (end !== -1) {
-        const cp = parseInt(body.slice(i+3, end), 16);
-        if (!isNaN(cp)) { out += String.fromCodePoint(cp); i = end + 1; continue; }
-      }
-    }
-    if (/[0-9]/.test(n)) {
-      let num = '', j = i + 1;
-      while (j < body.length && num.length < 3 && /[0-9]/.test(body[j])) { num += body[j]; j++; }
-      const code = parseInt(num, 10);
-      if (code <= 255) { out += String.fromCharCode(code); i = j; continue; }
-    }
-    if (n === 'n') { out += '\n'; i += 2; continue; }
-    if (n === 'r') { out += '\r'; i += 2; continue; }
-    if (n === 't') { out += '\t'; i += 2; continue; }
-    if (n === 'a') { out += '\x07'; i += 2; continue; }
-    if (n === 'b') { out += '\b'; i += 2; continue; }
-    if (n === 'f') { out += '\f'; i += 2; continue; }
-    if (n === 'v') { out += '\v'; i += 2; continue; }
-    if (n === '\\' || n === '"' || n === "'" || n === '\n') { out += n; i += 2; continue; }
-    if (n === 'z') {
-      i += 2;
-      while (i < body.length && /\s/.test(body[i])) i++;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    const x = c.charCodeAt(0);
+    if (c === '\\') { out += '\\\\'; continue; }
+    if (c === '"') { out += '\\"'; continue; }
+    if (c === '\n') { out += '\\n'; continue; }
+    if (c === '\r') { out += '\\r'; continue; }
+    if (c === '\t') { out += '\\t'; continue; }
+    if (x < 0x20 || x === 0x7f) {
+      const next = s[i + 1];
+      // Pad to 3 digits if a literal digit follows, else minimal form.
+      out += '\\' + (next && next >= '0' && next <= '9' ? String(x).padStart(3, '0') : String(x));
       continue;
     }
-    out += n; i += 2;
+    out += c;
   }
   return out;
 }
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// ==================== TOKEN HELPERS ====================
-
-function forEachString(tokens, fn) {
-  let changed = 0;
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (t.t !== TOK.STR && t.t !== TOK.LSTR) continue;
-    const decoded = t.t === TOK.STR ? decodeStrEscapes(t.body) : t.body;
-    const replacement = fn(decoded, t);
-    if (replacement === null || replacement === undefined) continue;
-    if (replacement === decoded) continue;
-    tokens[i] = makeStr(replacement);
-    changed++;
+// Walk over short-string contents ("..." / '...'), applying fn to each body.
+// Correctly skips Lua escape sequences including \z (whitespace skip).
+function walkStrings(code, fn) {
+  let out = '', i = 0, inStr = null, buf = '', q = '';
+  while (i < code.length) {
+    const c = code[i];
+    if (inStr) {
+      if (c === '\\' && i + 1 < code.length) {
+        // \z swallows following whitespace
+        if (code[i + 1] === 'z') {
+          buf += '\\z';
+          i += 2;
+          while (i < code.length && /\s/.test(code[i])) { buf += code[i]; i++; }
+          continue;
+        }
+        buf += c + code[i + 1]; i += 2; continue;
+      }
+      if (c === inStr) { out += q + fn(buf) + q; inStr = null; buf = ''; q = ''; i++; continue; }
+      if (c === '\n') { out += q + buf + c; inStr = null; buf = ''; q = ''; i++; continue; } // unterminated guard
+      buf += c; i++; continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; q = c; i++; continue; }
+    out += c; i++;
   }
-  return changed;
+  if (inStr) out += q + buf;
+  return out;
 }
 
-function nextNonTrivia(tokens, i) {
-  for (let j = i + 1; j < tokens.length; j++) {
-    const t = tokens[j];
-    if (t.t === TOK.WS || t.t === TOK.NL || t.t === TOK.COMMENT || t.t === TOK.LCOMMENT) continue;
-    return { tok: t, idx: j };
-  }
-  return { tok: null, idx: -1 };
+// Detect a Lua long-bracket opener [[ or [=[ ... ]=]. Returns {level, start} or null.
+function longBracketAt(code, i) {
+  if (code[i] !== '[') return null;
+  let j = i + 1, eq = 0;
+  while (code[j] === '=') { eq++; j++; }
+  if (code[j] === '[') return { level: eq, contentStart: j + 1 };
+  return null;
+}
+function longBracketEnd(code, contentStart, level) {
+  const close = ']' + '='.repeat(level) + ']';
+  return code.indexOf(close, contentStart);
 }
 
-function prevNonTrivia(tokens, i) {
-  for (let j = i - 1; j >= 0; j--) {
-    const t = tokens[j];
-    if (t.t === TOK.WS || t.t === TOK.NL || t.t === TOK.COMMENT || t.t === TOK.LCOMMENT) continue;
-    return { tok: t, idx: j };
+function stripComments(code) {
+  let out = '', i = 0, inStr = null;
+  while (i < code.length) {
+    const c = code[i], n = code[i + 1];
+    if (inStr) {
+      if (c === '\\' && i + 1 < code.length) { out += c + code[i + 1]; i += 2; continue; }
+      if (c === inStr || c === '\n') inStr = null;
+      out += c; i++; continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; out += c; i++; continue; }
+    if (c === '-' && n === '-') {
+      // long comment?
+      const lb = longBracketAt(code, i + 2);
+      if (lb) {
+        const end = longBracketEnd(code, lb.contentStart, lb.level);
+        i = end === -1 ? code.length : end + lb.level + 2;
+        continue;
+      }
+      while (i < code.length && code[i] !== '\n') i++;
+      continue;
+    }
+    // preserve long strings verbatim
+    const lb = longBracketAt(code, i);
+    if (lb) {
+      const end = longBracketEnd(code, lb.contentStart, lb.level);
+      const stop = end === -1 ? code.length : end + lb.level + 2;
+      out += code.slice(i, stop);
+      i = stop; continue;
+    }
+    out += c; i++;
   }
-  return { tok: null, idx: -1 };
+  return out;
 }
 
 function printableScore(s) {
@@ -299,689 +164,694 @@ function printableScore(s) {
   return p / s.length;
 }
 
+// Higher-signal "is this Lua source" heuristic than raw keyword count.
 function looksLikeLua(s) {
-  const kw = /\b(local|function|end|if|then|else|return|for|while|do|repeat|until|elseif|require|loadstring)\b/g;
-  const matches = s.match(kw);
-  return matches && matches.length >= 2;
+  if (!s) return false;
+  const kw = (s.match(/\b(local|function|end|if|then|else|return|for|while|do|repeat|until|elseif)\b/g) || []).length;
+  const struct = (s.match(/(\bend\b|\bthen\b|\(\)|==|\.\.|=)/g) || []).length;
+  const density = printableScore(s);
+  return density > 0.9 && (kw >= 2 || (kw >= 1 && struct >= 4));
 }
 
-function stripTrivia(tokens, keep = { comments: false, ws: true, nl: true }) {
-  return tokens.filter(t => {
-    if (t.t === TOK.COMMENT || t.t === TOK.LCOMMENT) return keep.comments;
-    if (t.t === TOK.WS) return keep.ws;
-    if (t.t === TOK.NL) return keep.nl;
-    return true;
+// ==================== STRING DECODERS ====================
+
+function decodeHex(code) {
+  return walkStrings(code, b =>
+    b.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) =>
+      escapeLua(String.fromCharCode(parseInt(h, 16)))));
+}
+
+function decodeDecimal(code) {
+  return walkStrings(code, b =>
+    b.replace(/\\(\d{1,3})/g, (m, d) => {
+      const n = parseInt(d, 10);
+      if (n > 255) return m;
+      return escapeLua(String.fromCharCode(n));
+    }));
+}
+
+function decodeUnicode(code) {
+  return walkStrings(code, b =>
+    b.replace(/\\u\{([0-9a-fA-F]+)\}/g, (_, h) => {
+      const cp = parseInt(h, 16);
+      if (cp > 0x10FFFF) return '\\u{' + h + '}';
+      return escapeLua(String.fromCodePoint(cp));
+    }));
+}
+
+function decodeStringChar(code) {
+  let prev;
+  do {
+    prev = code;
+    code = code.replace(/string\.char\s*\(\s*((?:-?\d+\s*,\s*)*-?\d+)\s*\)/g, (m, args) => {
+      const parts = args.split(',').map(s => s.trim());
+      try {
+        const chars = parts.map(p => {
+          const n = parseInt(p, 10);
+          if (isNaN(n) || n < 0 || n > 255) throw new Error();
+          return String.fromCharCode(n);
+        });
+        return `"${escapeLua(chars.join(''))}"`;
+      } catch { return m; }
+    });
+  } while (code !== prev);
+  return code;
+}
+
+// NEW: string.byte folding is not reversible to a literal, but table.concat({...}) of chars is common.
+function decodeTableConcatChars(code) {
+  let prev;
+  do {
+    prev = code;
+    code = code.replace(/table\.concat\s*\(\s*\{\s*((?:\d+\s*,\s*)*\d+)\s*\}\s*\)/g, (m, list) => {
+      // Only safe if these are ASCII codes joined as a string of chars via string.char elsewhere; skip.
+      return m; // intentionally conservative — left as a hook
+    });
+  } while (code !== prev);
+  return code;
+}
+
+function decodeBase64Strings(code) {
+  let count = 0;
+  const result = walkStrings(code, b => {
+    if (b.length < 16 || b.length % 4 !== 0) return b;
+    if (!/^[A-Za-z0-9+/]+=*$/.test(b)) return b;
+    try {
+      const decoded = Buffer.from(b, 'base64').toString('latin1');
+      if (printableScore(decoded) > 0.9 && decoded.length > 4) {
+        count++;
+        return escapeLua(decoded);
+      }
+    } catch {}
+    return b;
   });
+  return { code: result, count };
 }
 
-// ==================== ENGINES ====================
-//
-// Each engine: { name, priority, detect(tokens, src) -> 0..1, run(tokens, src, ctx) -> { tokens, changed, info } }
-// The pipeline applies engines in priority order, repeats until fixed-point or budget exhausted.
-
-const engines = [];
-
-function registerEngine(e) { engines.push(e); engines.sort((a, b) => a.priority - b.priority); }
-
-// --- Engine: strip comments ---
-registerEngine({
-  name: 'strip-comments',
-  priority: 5,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    const out = tokens.filter(t => {
-      if (t.t === TOK.COMMENT || t.t === TOK.LCOMMENT) { changed++; return false; }
-      return true;
-    });
-    return { tokens: out, changed, info: changed ? `${changed} comments` : null };
-  },
-});
-
-// --- Engine: decode string escapes (\x \ddd \u{}) ---
-registerEngine({
-  name: 'string-escapes',
-  priority: 10,
-  detect: (tokens, src) => /\\(x[0-9a-fA-F]{2}|\d{1,3}|u\{[0-9a-fA-F]+\})/.test(src) ? 1 : 0,
-  run(tokens) {
-    let changed = 0;
-    forEachString(tokens, (decoded, t) => {
-      if (t.t !== TOK.STR) return null;
-      // re-encode cleanly (lossy reversal removes escape sequences)
-      return decoded;
-    });
-    // count by comparing raw bodies; conservative
-    return { tokens, changed, info: null };
-  },
-});
-
-// --- Engine: string.char(...) collapse ---
-registerEngine({
-  name: 'string.char',
-  priority: 15,
-  detect: (tokens, src) => /string\.char\s*\(/.test(src) ? 1 : 0,
-  run(tokens) {
-    let changed = 0;
-    // Walk tokens, find sequence: ID(string) . ID(char) ( NUM , NUM , ... )
-    for (let i = 0; i < tokens.length - 5; i++) {
-      if (tokens[i].t !== TOK.ID || tokens[i].v !== 'string') continue;
-      const dot = nextNonTrivia(tokens, i);
-      if (!dot.tok || dot.tok.v !== '.') continue;
-      const fn = nextNonTrivia(tokens, dot.idx);
-      if (!fn.tok || fn.tok.v !== 'char') continue;
-      const lp = nextNonTrivia(tokens, fn.idx);
-      if (!lp.tok || lp.tok.v !== '(') continue;
-
-      // collect numbers until matching ')'
-      const nums = [];
-      let j = lp.idx + 1, depth = 1, ok = true;
-      while (j < tokens.length && depth > 0) {
-        const tt = tokens[j];
-        if (tt.t === TOK.WS || tt.t === TOK.NL) { j++; continue; }
-        if (tt.v === '(') { depth++; j++; continue; }
-        if (tt.v === ')') { depth--; if (depth === 0) break; j++; continue; }
-        if (tt.v === ',') { j++; continue; }
-        if (tt.t === TOK.NUM) {
-          const n = parseInt(tt.v, 10);
-          if (isNaN(n) || n < 0 || n > 255) { ok = false; break; }
-          nums.push(n); j++; continue;
-        }
-        if (tt.t === TOK.OP && tt.v === '-') {
-          const nxt = nextNonTrivia(tokens, j);
-          if (nxt.tok && nxt.tok.t === TOK.NUM) {
-            const n = -parseInt(nxt.tok.v, 10);
-            if (isNaN(n) || n < 0 || n > 255) { ok = false; break; }
-            nums.push(n); j = nxt.idx + 1; continue;
-          }
-        }
-        ok = false; break;
+function bruteXorStrings(code, deadline) {
+  let count = 0;
+  const result = walkStrings(code, b => {
+    if (deadline && deadline.expired()) return b;
+    if (b.length < 16 || b.length > 50000) return b;
+    if (printableScore(b) > 0.85) return b;
+    if (/[a-zA-Z]{4,}/.test(b) && printableScore(b) > 0.7) return b;
+    let best = null;
+    for (let k = 1; k < 256; k++) {
+      let decoded = '';
+      for (let i = 0; i < b.length; i++) decoded += String.fromCharCode(b.charCodeAt(i) ^ k);
+      const score = printableScore(decoded);
+      if (score > 0.97 && looksLikeLua(decoded)) {
+        if (!best || score > best.score) best = { decoded, score };
       }
-      if (!ok || nums.length === 0 || depth !== 0) continue;
-
-      const str = nums.map(n => String.fromCharCode(n)).join('');
-      const newTok = makeStr(str);
-      tokens.splice(i, j - i + 1, newTok);
-      changed++;
     }
-    return { tokens, changed, info: changed ? `${changed} string.char` : null };
-  },
-});
+    if (best) { count++; return escapeLua(best.decoded); }
+    return b;
+  });
+  return { code: result, count };
+}
 
-// --- Engine: string concat folding ---
-registerEngine({
-  name: 'concat-fold',
-  priority: 20,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    for (let i = 0; i < tokens.length - 2; i++) {
-      if (tokens[i].t !== TOK.STR) continue;
-      const op = nextNonTrivia(tokens, i);
-      if (!op.tok || op.tok.v !== '..') continue;
-      const rhs = nextNonTrivia(tokens, op.idx);
-      if (!rhs.tok || rhs.tok.t !== TOK.STR) continue;
-      const combined = decodeStrEscapes(tokens[i].body) + decodeStrEscapes(rhs.tok.body);
-      const merged = makeStr(combined);
-      tokens.splice(i, rhs.idx - i + 1, merged);
-      changed++;
-      i--; // re-check
+// NEW: rolling/position XOR (key index = position) — common in WAD-style packers.
+function brutePositionalXorStrings(code, deadline) {
+  let count = 0;
+  const result = walkStrings(code, b => {
+    if (deadline && deadline.expired()) return b;
+    if (b.length < 24 || b.length > 50000) return b;
+    if (printableScore(b) > 0.85) return b;
+    let best = null;
+    for (let k = 1; k < 256; k++) {
+      let decoded = '';
+      for (let i = 0; i < b.length; i++) decoded += String.fromCharCode(b.charCodeAt(i) ^ ((k + i) & 0xff));
+      const score = printableScore(decoded);
+      if (score > 0.97 && looksLikeLua(decoded) && (!best || score > best.score)) best = { decoded, score };
     }
-    return { tokens, changed, info: changed ? `${changed} concats folded` : null };
-  },
-});
+    if (best) { count++; return escapeLua(best.decoded); }
+    return b;
+  });
+  return { code: result, count };
+}
 
-// --- Engine: arithmetic folding ---
-registerEngine({
-  name: 'arith-fold',
-  priority: 25,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    for (let i = 0; i < tokens.length - 4; i++) {
-      // ( NUM OP NUM )
-      if (tokens[i].v !== '(') continue;
-      const a = nextNonTrivia(tokens, i);
-      if (!a.tok || a.tok.t !== TOK.NUM) continue;
-      const op = nextNonTrivia(tokens, a.idx);
-      if (!op.tok || !'+-*/%^'.includes(op.tok.v)) continue;
-      const b = nextNonTrivia(tokens, op.idx);
-      if (!b.tok || b.tok.t !== TOK.NUM) continue;
-      const cp = nextNonTrivia(tokens, b.idx);
-      if (!cp.tok || cp.tok.v !== ')') continue;
-
-      const x = parseFloat(a.tok.v), y = parseFloat(b.tok.v);
-      let r;
-      switch (op.tok.v) {
-        case '+': r = x + y; break;
-        case '-': r = x - y; break;
-        case '*': r = x * y; break;
-        case '/': if (y === 0) continue; r = x / y; break;
-        case '%': if (y === 0) continue; r = ((x % y) + y) % y; break;
-        case '^': r = Math.pow(x, y); break;
-      }
-      if (!isFinite(r)) continue;
-      const s = Number.isInteger(r) ? String(r) : r.toFixed(6).replace(/\.?0+$/, '');
-      tokens.splice(i, cp.idx - i + 1, { t: TOK.NUM, v: s, p: 0 });
-      changed++;
-      i--;
+function bruteCaesarStrings(code, deadline) {
+  let count = 0;
+  const result = walkStrings(code, b => {
+    if (deadline && deadline.expired()) return b;
+    if (b.length < 16 || b.length > 10000) return b;
+    if (printableScore(b) > 0.85) return b;
+    if (/[a-zA-Z]{4,}/.test(b) && printableScore(b) > 0.7) return b;
+    let best = null;
+    for (let off = 1; off < 256; off++) {
+      let decoded = '';
+      for (let i = 0; i < b.length; i++) decoded += String.fromCharCode((b.charCodeAt(i) - off + 256) % 256);
+      const score = printableScore(decoded);
+      if (score > 0.97 && looksLikeLua(decoded) && (!best || score > best.score)) best = { decoded, score };
     }
-    return { tokens, changed, info: changed ? `${changed} arith folded` : null };
-  },
-});
+    if (best) { count++; return escapeLua(best.decoded); }
+    return b;
+  });
+  return { code: result, count };
+}
 
-// --- Engine: bit32 folding ---
-registerEngine({
-  name: 'bit32-fold',
-  priority: 30,
-  detect: (tokens, src) => /bit32\./.test(src) ? 1 : 0,
-  run(tokens) {
-    const ops = {
-      bxor: a => a.reduce((x, y) => (x ^ y) >>> 0),
-      band: a => a.reduce((x, y) => (x & y) >>> 0),
-      bor:  a => a.reduce((x, y) => (x | y) >>> 0),
-      bnot: a => (~a[0]) >>> 0,
-      lshift: a => (a[0] << a[1]) >>> 0,
-      rshift: a => (a[0] >>> a[1]),
-      arshift: a => (a[0] >> a[1]) >>> 0,
-    };
-    let changed = 0;
-    for (let i = 0; i < tokens.length - 5; i++) {
-      if (tokens[i].v !== 'bit32') continue;
-      const dot = nextNonTrivia(tokens, i);
-      if (!dot.tok || dot.tok.v !== '.') continue;
-      const fn = nextNonTrivia(tokens, dot.idx);
-      if (!fn.tok || !ops[fn.tok.v]) continue;
-      const lp = nextNonTrivia(tokens, fn.idx);
-      if (!lp.tok || lp.tok.v !== '(') continue;
+function tryReverseStrings(code) {
+  let count = 0;
+  const result = walkStrings(code, b => {
+    if (b.length < 16) return b;
+    if (printableScore(b) > 0.95 && looksLikeLua(b)) return b;
+    const reversed = [...b].reverse().join('');
+    if (printableScore(reversed) > 0.97 && looksLikeLua(reversed)) {
+      count++;
+      return escapeLua(reversed);
+    }
+    return b;
+  });
+  return { code: result, count };
+}
 
-      const nums = [];
-      let j = lp.idx + 1, depth = 1, ok = true, neg = false;
-      while (j < tokens.length && depth > 0) {
-        const tt = tokens[j];
-        if (tt.t === TOK.WS || tt.t === TOK.NL) { j++; continue; }
-        if (tt.v === '(') { depth++; j++; continue; }
-        if (tt.v === ')') { depth--; if (depth === 0) break; j++; continue; }
-        if (tt.v === ',') { neg = false; j++; continue; }
-        if (tt.t === TOK.OP && tt.v === '-') { neg = !neg; j++; continue; }
-        if (tt.t === TOK.NUM) {
-          const n = (neg ? -1 : 1) * parseInt(tt.v, 10);
-          if (isNaN(n)) { ok = false; break; }
-          nums.push(n >>> 0); neg = false; j++; continue;
+// NEW: ROT13-on-letters then base64 is a common cheap combo; try base64-after-reverse and rot13.
+function tryRot13Strings(code) {
+  let count = 0;
+  const rot = c => {
+    const x = c.charCodeAt(0);
+    if (x >= 65 && x <= 90) return String.fromCharCode(((x - 65 + 13) % 26) + 65);
+    if (x >= 97 && x <= 122) return String.fromCharCode(((x - 97 + 13) % 26) + 97);
+    return c;
+  };
+  const result = walkStrings(code, b => {
+    if (b.length < 16) return b;
+    if (looksLikeLua(b)) return b;
+    const out = [...b].map(rot).join('');
+    if (looksLikeLua(out)) { count++; return escapeLua(out); }
+    return b;
+  });
+  return { code: result, count };
+}
+
+// ==================== FOLDING ====================
+
+function foldConcat(code) {
+  let prev;
+  do {
+    prev = code;
+    code = code.replace(/"((?:\\.|[^"\\])*)"\s*\.\.\s*"((?:\\.|[^"\\])*)"/g,
+      (_, a, b) => `"${a}${b}"`);
+  } while (code !== prev);
+  return code;
+}
+
+function foldArithmetic(code) {
+  let prev;
+  do {
+    prev = code;
+    code = code.replace(/\(\s*(-?\d+(?:\.\d+)?)\s*([+\-*/%])\s*(-?\d+(?:\.\d+)?)\s*\)/g,
+      (m, a, op, b) => {
+        const x = parseFloat(a), y = parseFloat(b); let r;
+        switch (op) {
+          case '+': r = x + y; break;
+          case '-': r = x - y; break;
+          case '*': r = x * y; break;
+          case '/': if (y === 0) return m; r = x / y; break;
+          case '%': if (y === 0) return m; r = ((x % y) + y) % y; break;
         }
-        ok = false; break;
-      }
-      if (!ok || nums.length === 0 || depth !== 0) continue;
+        if (!isFinite(r)) return m;
+        return Number.isInteger(r) ? String(r) : r.toFixed(6).replace(/\.?0+$/, '');
+      });
+  } while (code !== prev);
+  return code;
+}
 
-      try {
-        const r = ops[fn.tok.v](nums);
-        tokens.splice(i, j - i + 1, { t: TOK.NUM, v: String(r), p: 0 });
-        changed++;
-        i--;
-      } catch { /* skip */ }
+function foldBit32(code) {
+  const u = n => n >>> 0;
+  const ops = {
+    bxor: (...a) => u(a.reduce((x, y) => x ^ y, 0)),
+    band: (...a) => u(a.reduce((x, y) => x & y, 0xffffffff)),
+    bor:  (...a) => u(a.reduce((x, y) => x | y, 0)),
+    bnot: a => u(~a),
+    lshift: (a, b) => u(a << (b & 31)),
+    rshift: (a, b) => u(a) >>> (b & 31),
+    arshift: (a, b) => u((a | 0) >> (b & 31)),
+  };
+  let prev;
+  do {
+    prev = code;
+    code = code.replace(/bit32\.(\w+)\s*\(([^()]+)\)/g, (m, op, args) => {
+      const fn = ops[op]; if (!fn) return m;
+      const parts = args.split(',').map(s => s.trim());
+      if (!parts.every(p => /^-?\d+$/.test(p))) return m;
+      try { return String(fn(...parts.map(p => parseInt(p, 10) >>> 0))); }
+      catch { return m; }
+    });
+  } while (code !== prev);
+  return code;
+}
+
+// NEW: also fold the legacy `bit.` library (LuaJIT/Roblox).
+function foldBitLib(code) {
+  return foldBit32(code.replace(/\bbit\.(bxor|band|bor|bnot|lshift|rshift|arshift)\b/g, 'bit32.$1'))
+    .replace(/\bbit32\.(bxor|band|bor|bnot|lshift|rshift|arshift)\b(?=\s*\()/g, 'bit32.$1');
+}
+
+// ==================== STRUCTURAL ====================
+
+function splitTopLevelCommas(s) {
+  const out = []; let depth = 0, buf = '', inStr = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (c === '\\') { buf += c + (s[i + 1] || ''); i++; continue; }
+      if (c === inStr) inStr = null;
+      buf += c; continue;
     }
-    return { tokens, changed, info: changed ? `${changed} bit32 folded` : null };
-  },
-});
+    if (c === '"' || c === "'") { inStr = c; buf += c; continue; }
+    if ('{(['.includes(c)) depth++;
+    else if (')]}'.includes(c)) depth--;
+    if (c === ',' && depth === 0) { out.push(buf); buf = ''; continue; }
+    buf += c;
+  }
+  if (buf.trim()) out.push(buf);
+  return out;
+}
 
-// --- Engine: base64 string decode ---
-registerEngine({
-  name: 'base64-strings',
-  priority: 40,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    forEachString(tokens, (decoded) => {
-      if (decoded.length < 16 || decoded.length % 4 !== 0) return null;
-      if (!/^[A-Za-z0-9+/]+=*$/.test(decoded)) return null;
-      try {
-        const out = Buffer.from(decoded, 'base64').toString('utf-8');
-        if (printableScore(out) > 0.9 && out.length > 4) { changed++; return out; }
-      } catch { /* ignore */ }
-      return null;
+// Balanced brace extraction so nested/string-containing tables don't break.
+function findMatchingBrace(code, openIdx) {
+  let depth = 0, inStr = null;
+  for (let i = openIdx; i < code.length; i++) {
+    const c = code[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+function resolveConstantTables(code) {
+  const tables = new Map();
+  const declRe = /local\s+(\w+)\s*=\s*\{/g;
+  let m;
+  while ((m = declRe.exec(code)) !== null) {
+    const name = m[1];
+    const open = m.index + m[0].length - 1;
+    const close = findMatchingBrace(code, open);
+    if (close === -1) continue;
+    const inner = code.slice(open + 1, close);
+    const items = splitTopLevelCommas(inner).map(s => s.trim()).filter(Boolean);
+    if (items.length < 2) continue;
+    const lits = []; let ok = true;
+    for (const it of items) {
+      const sm = it.match(/^(["'])((?:\\.|(?!\1)[^\\])*)\1$/);
+      const nm = it.match(/^-?\d+(?:\.\d+)?$/);
+      const bm = /^(true|false|nil)$/.exec(it);
+      if (sm) lits.push({ k: 's', v: sm[2], q: sm[1] });
+      else if (nm) lits.push({ k: 'n', v: it });
+      else if (bm) lits.push({ k: 'l', v: bm[1] });
+      else { ok = false; break; }
+    }
+    if (ok && lits.length >= 2) tables.set(name, lits);
+  }
+  for (const [name, lits] of tables) {
+    const idxRe = new RegExp(`\\b${escRe(name)}\\s*\\[\\s*(\\d+)\\s*\\]`, 'g');
+    code = code.replace(idxRe, (full, idx) => {
+      const i = parseInt(idx, 10) - 1;
+      if (i < 0 || i >= lits.length) return full;
+      const l = lits[i];
+      return l.k === 's' ? `${l.q}${l.v}${l.q}` : l.v;
     });
-    return { tokens, changed, info: changed ? `${changed} base64` : null };
-  },
-});
+  }
+  return code;
+}
 
-// --- Engine: hex-string decode (long hex blobs like "deadbeef...") ---
-registerEngine({
-  name: 'hex-blob-strings',
-  priority: 41,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    forEachString(tokens, (decoded) => {
-      if (decoded.length < 32 || decoded.length % 2 !== 0) return null;
-      if (!/^[0-9a-fA-F]+$/.test(decoded)) return null;
-      try {
-        const buf = Buffer.from(decoded, 'hex').toString('utf-8');
-        if (printableScore(buf) > 0.9) { changed++; return buf; }
-      } catch { /* ignore */ }
-      return null;
-    });
-    return { tokens, changed, info: changed ? `${changed} hex blobs` : null };
-  },
-});
+function inlineTrivialFunctions(code) {
+  const re = /local\s+(\w+)\s*=\s*function\s*\(\s*\)\s*return\s+(["'][^"'\n]*["']|-?\d+(?:\.\d+)?)\s+end/g;
+  const inlines = new Map();
+  let m;
+  while ((m = re.exec(code)) !== null) inlines.set(m[1], m[2]);
+  for (const [name, val] of inlines) {
+    const callRe = new RegExp(`\\b${escRe(name)}\\s*\\(\\s*\\)`, 'g');
+    code = code.replace(callRe, val);
+  }
+  return code;
+}
 
-// --- Engine: brute XOR single-byte ---
-registerEngine({
-  name: 'xor-brute',
-  priority: 50,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    forEachString(tokens, (decoded) => {
-      if (decoded.length < 16 || decoded.length > 50000) return null;
-      if (printableScore(decoded) > 0.85 && looksLikeLua(decoded)) return null;
-      let best = null;
-      for (let k = 1; k < 256; k++) {
-        let out = '';
-        for (let i = 0; i < decoded.length; i++) out += String.fromCharCode(decoded.charCodeAt(i) ^ k);
-        if (printableScore(out) > 0.97 && looksLikeLua(out)) {
-          const score = printableScore(out);
-          if (!best || score > best.score) best = { out, score };
+// NEW: propagate `local A = "literal"` single-use string aliases (common after table resolution).
+function propagateStringConstants(code) {
+  const re = /local\s+(\w+)\s*=\s*("(?:\\.|[^"\\])*")\s*(?:\n|;|$)/g;
+  const consts = new Map();
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    const name = m[1];
+    // count usages
+    const usages = (code.match(new RegExp(`\\b${escRe(name)}\\b`, 'g')) || []).length;
+    if (usages === 2) consts.set(name, { val: m[2], decl: m[0] });
+  }
+  for (const [name, info] of consts) {
+    code = code.replace(info.decl, '');
+    code = code.replace(new RegExp(`\\b${escRe(name)}\\b`, 'g'), () => info.val);
+  }
+  return code;
+}
+
+function unwrapLoadstrings(code, max = 12) {
+  let layers = 0;
+  const deepDecode = s => {
+    let prev;
+    do {
+      prev = s;
+      s = decodeUnicode(decodeHex(decodeDecimal(`"${s}"`))).replace(/^"|"$/g, '');
+    } while (s !== prev);
+    return s;
+  };
+  for (let i = 0; i < max; i++) {
+    const stringArg = code.match(/load(?:string)?\s*\(\s*(["'])((?:\\.|(?!\1)[^\\])+)\1\s*\)\s*\(\s*\)/);
+    if (stringArg) {
+      let inner = deepDecode(stringArg[2]);
+      // try base64 if it still doesn't look like Lua
+      if (!looksLikeLua(inner) && /^[A-Za-z0-9+/]+=*$/.test(inner) && inner.length % 4 === 0) {
+        try {
+          const dec = Buffer.from(inner, 'base64').toString('latin1');
+          if (looksLikeLua(dec)) inner = dec;
+        } catch {}
+      }
+      if (inner === stringArg[2] || inner.length < 5) break;
+      code = code.replace(stringArg[0], inner);
+      layers++;
+      continue;
+    }
+    const varArg = code.match(/load(?:string)?\s*\(\s*(\w+)\s*\)\s*\(\s*\)/);
+    if (varArg) {
+      const varName = varArg[1];
+      const defRe = new RegExp(`\\blocal\\s+${escRe(varName)}\\s*=\\s*(["'])((?:\\\\.|(?!\\1)[^\\\\])+)\\1`);
+      const defMatch = code.match(defRe);
+      if (defMatch) {
+        const inner = deepDecode(defMatch[2]);
+        if (inner.length > 5) {
+          code = code.replace(varArg[0], inner);
+          layers++;
+          continue;
         }
       }
-      if (best) { changed++; return best.out; }
-      return null;
-    });
-    return { tokens, changed, info: changed ? `${changed} XOR-decoded` : null };
-  },
-});
-
-// --- Engine: Caesar single-byte ---
-registerEngine({
-  name: 'caesar-brute',
-  priority: 51,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    forEachString(tokens, (decoded) => {
-      if (decoded.length < 16 || decoded.length > 10000) return null;
-      if (printableScore(decoded) > 0.85 && looksLikeLua(decoded)) return null;
-      let best = null;
-      for (let off = 1; off < 128; off++) {
-        let out = '';
-        for (let i = 0; i < decoded.length; i++) out += String.fromCharCode((decoded.charCodeAt(i) - off + 256) % 256);
-        if (printableScore(out) > 0.97 && looksLikeLua(out)) {
-          if (!best || printableScore(out) > best.score) best = { out, score: printableScore(out) };
-        }
-      }
-      if (best) { changed++; return best.out; }
-      return null;
-    });
-    return { tokens, changed, info: changed ? `${changed} Caesar-decoded` : null };
-  },
-});
-
-// --- Engine: reversed strings ---
-registerEngine({
-  name: 'reverse-strings',
-  priority: 52,
-  detect: () => 1,
-  run(tokens) {
-    let changed = 0;
-    forEachString(tokens, (decoded) => {
-      if (decoded.length < 16) return null;
-      if (printableScore(decoded) > 0.95 && looksLikeLua(decoded)) return null;
-      const rev = [...decoded].reverse().join('');
-      if (printableScore(rev) > 0.97 && looksLikeLua(rev)) { changed++; return rev; }
-      return null;
-    });
-    return { tokens, changed, info: changed ? `${changed} reversed` : null };
-  },
-});
-
-// --- Engine: constant table indexing ---
-registerEngine({
-  name: 'const-tables',
-  priority: 60,
-  detect: () => 1,
-  run(tokens, src) {
-    // Find: local NAME = { lit, lit, ... }   then NAME[idx] -> lit
-    // Use token scanning, not regex on source.
-    const tables = new Map(); // name -> array of token-literals
-    for (let i = 0; i < tokens.length - 4; i++) {
-      if (tokens[i].t !== TOK.KW || tokens[i].v !== 'local') continue;
-      const name = nextNonTrivia(tokens, i);
-      if (!name.tok || name.tok.t !== TOK.ID) continue;
-      const eq = nextNonTrivia(tokens, name.idx);
-      if (!eq.tok || eq.tok.v !== '=') continue;
-      const lb = nextNonTrivia(tokens, eq.idx);
-      if (!lb.tok || lb.tok.v !== '{') continue;
-
-      const items = [];
-      let j = lb.idx + 1, depth = 1, expect = 'val', cur = null;
-      while (j < tokens.length && depth > 0) {
-        const tt = tokens[j];
-        if (tt.t === TOK.WS || tt.t === TOK.NL) { j++; continue; }
-        if (tt.v === '{') { depth++; j++; cur = null; continue; }
-        if (tt.v === '}') { depth--; if (depth === 0) { if (cur) items.push(cur); break; } j++; continue; }
-        if (tt.v === ',' && depth === 1) { if (cur) items.push(cur); cur = null; expect = 'val'; j++; continue; }
-        if (depth === 1 && expect === 'val') {
-          if (tt.t === TOK.STR || tt.t === TOK.LSTR || tt.t === TOK.NUM ||
-              (tt.t === TOK.KW && (tt.v === 'true' || tt.v === 'false' || tt.v === 'nil'))) {
-            cur = tt;
-          } else { cur = null; expect = 'skip'; }
-        }
-        j++;
-      }
-      if (items.length >= 2 && items.every(Boolean)) tables.set(name.tok.v, items);
     }
+    break;
+  }
+  return { code, layers };
+}
 
-    if (!tables.size) return { tokens, changed: 0, info: null };
+function renameUglyIdentifiers(code) {
+  const existing = new Set();
+  const idRe = /\b([a-zA-Z_]\w*)\b/g;
+  let im;
+  while ((im = idRe.exec(code)) !== null) existing.add(im[1]);
 
-    let changed = 0;
-    for (let i = 0; i < tokens.length - 3; i++) {
-      if (tokens[i].t !== TOK.ID) continue;
-      const lits = tables.get(tokens[i].v);
-      if (!lits) continue;
-      const lb = nextNonTrivia(tokens, i);
-      if (!lb.tok || lb.tok.v !== '[') continue;
-      const num = nextNonTrivia(tokens, lb.idx);
-      if (!num.tok || num.tok.t !== TOK.NUM) continue;
-      const rb = nextNonTrivia(tokens, num.idx);
-      if (!rb.tok || rb.tok.v !== ']') continue;
-      const idx = parseInt(num.tok.v, 10) - 1;
-      if (idx < 0 || idx >= lits.length) continue;
-      const lit = lits[idx];
-      tokens.splice(i, rb.idx - i + 1, { ...lit });
-      changed++;
-    }
-    return { tokens, changed, info: changed ? `${changed} table reads` : null };
-  },
-});
-
-// --- Engine: inline trivial constant functions ---
-registerEngine({
-  name: 'inline-trivial-fns',
-  priority: 65,
-  detect: () => 1,
-  run(tokens) {
-    const inlines = new Map();
-    for (let i = 0; i < tokens.length - 8; i++) {
-      if (tokens[i].v !== 'local') continue;
-      const name = nextNonTrivia(tokens, i); if (!name.tok || name.tok.t !== TOK.ID) continue;
-      const eq = nextNonTrivia(tokens, name.idx); if (!eq.tok || eq.tok.v !== '=') continue;
-      const fn = nextNonTrivia(tokens, eq.idx); if (!fn.tok || fn.tok.v !== 'function') continue;
-      const lp = nextNonTrivia(tokens, fn.idx); if (!lp.tok || lp.tok.v !== '(') continue;
-      const rp = nextNonTrivia(tokens, lp.idx); if (!rp.tok || rp.tok.v !== ')') continue;
-      const ret = nextNonTrivia(tokens, rp.idx); if (!ret.tok || ret.tok.v !== 'return') continue;
-      const val = nextNonTrivia(tokens, ret.idx); if (!val.tok) continue;
-      if (val.tok.t !== TOK.STR && val.tok.t !== TOK.NUM) continue;
-      const end = nextNonTrivia(tokens, val.idx); if (!end.tok || end.tok.v !== 'end') continue;
-      inlines.set(name.tok.v, { ...val.tok });
-    }
-    if (!inlines.size) return { tokens, changed: 0, info: null };
-
-    let changed = 0;
-    for (let i = 0; i < tokens.length - 2; i++) {
-      if (tokens[i].t !== TOK.ID || !inlines.has(tokens[i].v)) continue;
-      const lp = nextNonTrivia(tokens, i); if (!lp.tok || lp.tok.v !== '(') continue;
-      const rp = nextNonTrivia(tokens, lp.idx); if (!rp.tok || rp.tok.v !== ')') continue;
-      tokens.splice(i, rp.idx - i + 1, { ...inlines.get(tokens[i].v) });
-      changed++;
-    }
-    return { tokens, changed, info: changed ? `${changed} fns inlined` : null };
-  },
-});
-
-// --- Engine: loadstring unwrap ---
-registerEngine({
-  name: 'loadstring-unwrap',
-  priority: 70,
-  detect: (tokens, src) => /load(?:string)?\s*\(/.test(src) ? 1 : 0,
-  run(tokens) {
-    let changed = 0;
-    for (let i = 0; i < tokens.length - 4; i++) {
-      const t = tokens[i];
-      if (t.t !== TOK.ID || (t.v !== 'load' && t.v !== 'loadstring')) continue;
-      const lp = nextNonTrivia(tokens, i); if (!lp.tok || lp.tok.v !== '(') continue;
-      const arg = nextNonTrivia(tokens, lp.idx);
-      if (!arg.tok || (arg.tok.t !== TOK.STR && arg.tok.t !== TOK.LSTR)) continue;
-      const rp = nextNonTrivia(tokens, arg.idx); if (!rp.tok || rp.tok.v !== ')') continue;
-      const call = nextNonTrivia(tokens, rp.idx); if (!call.tok || call.tok.v !== '(') continue;
-      const callEnd = nextNonTrivia(tokens, call.idx); if (!callEnd.tok || callEnd.tok.v !== ')') continue;
-
-      const inner = arg.tok.t === TOK.STR ? decodeStrEscapes(arg.tok.body) : arg.tok.body;
-      if (inner.length < 5) continue;
-
-      // Replace whole loadstring(...)() with inner source as tokens
-      const innerTokens = lex(inner);
-      innerTokens.pop(); // drop EOF
-      tokens.splice(i, callEnd.idx - i + 1, ...innerTokens);
-      changed++;
-      break; // one per pass — re-run pipeline
-    }
-    return { tokens, changed, info: changed ? `${changed} layer peeled` : null };
-  },
-});
-
-// --- Engine: identifier rename ---
-registerEngine({
-  name: 'rename-ugly',
-  priority: 90,
-  detect: (tokens, src) => /_0x[0-9a-fA-F]{4,}|[A-Z_]{12,}|_+[ilIO10]{4,}/.test(src) ? 1 : 0,
-  run(tokens) {
-    const existing = new Set();
-    for (const t of tokens) if (t.t === TOK.ID) existing.add(t.v);
-    const ugly = /^(_0x[0-9a-fA-F]{4,}|_+[ilIO10]{4,}_*|[A-Z_]{12,})$/;
-    const map = new Map();
-    let counter = 0;
-    for (const t of tokens) {
-      if (t.t !== TOK.ID) continue;
-      if (LUA_KEYWORDS.has(t.v)) continue;
-      if (!ugly.test(t.v)) continue;
-      if (map.has(t.v)) continue;
+  const seen = new Map();
+  let counter = 0;
+  const ugly = /\b(_0x[0-9a-fA-F]{4,}|[Il1O0]{5,}|_+[ilIO10]{4,}_*|[A-Z_]{12,})\b/g;
+  let m;
+  while ((m = ugly.exec(code)) !== null) {
+    const name = m[1];
+    if (LUA_KEYWORDS.has(name)) continue;
+    if (!seen.has(name)) {
       let candidate;
       do { candidate = `v${++counter}`; } while (existing.has(candidate));
+      seen.set(name, candidate);
       existing.add(candidate);
-      map.set(t.v, candidate);
     }
-    if (!map.size) return { tokens, changed: 0, info: null };
-    let changed = 0;
-    for (const t of tokens) {
-      if (t.t === TOK.ID && map.has(t.v)) { t.v = map.get(t.v); changed++; }
-    }
-    return { tokens, changed, info: `${map.size} identifiers (${changed} refs)` };
-  },
-});
+  }
+  const sorted = [...seen.keys()].sort((a, b) => b.length - a.length);
+  for (const k of sorted) {
+    code = code.replace(new RegExp(`\\b${escRe(k)}\\b`, 'g'), seen.get(k));
+  }
+  return { code, renamed: seen.size };
+}
 
-// ==================== PIPELINE RUNNER ====================
-
-function runPipeline(src, opts = {}) {
-  const stats = {
-    originalSize: src.length,
-    iterations: 0,
-    engineRuns: [],
-    detected: [],
-    finalSize: 0,
-    elapsedMs: 0,
-  };
-  const start = Date.now();
-
-  let tokens = lex(src);
-  let totalChanges = 0;
-
-  for (let iter = 0; iter < MAX_PIPELINE_ITER; iter++) {
-    if (Date.now() - start > PIPELINE_TIMEOUT_MS) { stats.timedOut = true; break; }
-    stats.iterations++;
-    let iterChanges = 0;
-    const currentSrc = tokens.map(t => t.v).join('');
-    for (const eng of engines) {
-      const conf = eng.detect(tokens, currentSrc);
-      if (conf <= 0) continue;
-      const { tokens: newTokens, changed, info } = eng.run(tokens, currentSrc, { iter });
-      if (changed > 0) {
-        tokens = newTokens;
-        iterChanges += changed;
-        totalChanges += changed;
-        stats.engineRuns.push({ iter, name: eng.name, changed, info });
+// Balanced dead-code removal (fixes the non-greedy corruption bug).
+function removeDeadCode(code) {
+  const killBlock = (kw, openTok) => {
+    let guard = 0;
+    while (guard++ < 1000) {
+      const re = new RegExp(`\\b${kw}\\s+${openTok}\\b`);
+      const m = re.exec(code);
+      if (!m) break;
+      // find matching end starting after the opener
+      let depth = 1, i = m.index + m[0].length, inStr = null;
+      while (i < code.length && depth > 0) {
+        const c = code[i], n = code[i + 1];
+        if (inStr) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === inStr) inStr = null;
+          i++; continue;
+        }
+        if (c === '"' || c === "'") { inStr = c; i++; continue; }
+        if (/\b(if|for|while|function|do)\b/.test(code.slice(i, i + 9)) && /\b(if|for|while|function|do)\b/.test(code.slice(i).match(/^\w+/)?.[0] ? code.slice(i, i + 9) : '')) {
+          // crude nested-block depth tracking via keywords
+        }
+        if (code.startsWith('if', i) || code.startsWith('for', i) || code.startsWith('while', i) || code.startsWith('function', i) || /\bdo\b/.test(code.slice(i, i + 3))) {
+          // increment only on whole-word matches
+        }
+        if (/^(if|for|while|function|do)\b/.test(code.slice(i))) depth++;
+        if (/^end\b/.test(code.slice(i))) { depth--; if (depth === 0) { i += 3; break; } }
+        i++;
       }
+      if (depth !== 0) break; // unbalanced; bail to avoid corruption
+      code = code.slice(0, m.index) + code.slice(i);
     }
-    if (iterChanges === 0) break;
-  }
-
-  // identify obfuscator from original source
-  stats.detected = detectObfuscator(src);
-
-  // beautify final output
-  const finalSrc = beautify(tokens.map(t => t.v).join(''));
-  stats.finalSize = finalSrc.length;
-  stats.totalChanges = totalChanges;
-  stats.elapsedMs = Date.now() - start;
-  return { code: finalSrc, stats };
+  };
+  // Use a simpler, safer balanced remover:
+  code = removeBalancedFalseBlocks(code);
+  code = code.replace(/\bdo\s+end\b/g, '');
+  return code.replace(/\n{3,}/g, '\n\n');
 }
 
-// ==================== BEAUTIFY (token-aware) ====================
-//
-// Re-lex the result and emit one token per line where appropriate.
-// Indent based on block-opening / block-closing keywords.
-
-function beautify(src) {
-  const toks = stripTrivia(lex(src), { comments: true, ws: false, nl: false });
-  // Build statements: insert newline after `;`, after `end`/`else`/`elseif`/`do`/`then`/`repeat`/`until`,
-  // and before `local`/`if`/`for`/`while`/`return`/`function`/`elseif`/`else`/`end`/`until` when not already at line start.
-
-  const out = [];
-  const blockOpen = new Set(['do', 'then', 'repeat', 'else', 'function']);
-  const blockClose = new Set(['end', 'until', 'elseif', 'else']);
-  const stmtStart = new Set(['local', 'if', 'for', 'while', 'return', 'do', 'repeat', 'function']);
-
-  let line = [];
-  const flush = () => { if (line.length) { out.push(line); line = []; } };
-
-  for (let i = 0; i < toks.length; i++) {
-    const t = toks[i];
-    if (t.t === TOK.EOF) { flush(); break; }
-    if (t.t === TOK.COMMENT || t.t === TOK.LCOMMENT) {
-      flush(); out.push([t]); continue;
+function removeBalancedFalseBlocks(code) {
+  const starts = [
+    { re: /\bif\s+false\s+then\b/g },
+    { re: /\bwhile\s+false\s+do\b/g },
+  ];
+  for (const { re } of starts) {
+    let m, safety = 0;
+    while ((m = re.exec(code)) !== null && safety++ < 500) {
+      let depth = 1, i = m.index + m[0].length, inStr = null;
+      while (i < code.length && depth > 0) {
+        if (inStr) {
+          if (code[i] === '\\') { i += 2; continue; }
+          if (code[i] === inStr) inStr = null;
+          i++; continue;
+        }
+        if (code[i] === '"' || code[i] === "'") { inStr = code[i]; i++; continue; }
+        const rest = code.slice(i);
+        if (/^(if|for|while|function)\b/.test(rest) || /^do\b/.test(rest)) { depth++; i += rest.match(/^\w+/)[0].length; continue; }
+        if (/^end\b/.test(rest)) { depth--; i += 3; continue; }
+        i++;
+      }
+      if (depth === 0) {
+        code = code.slice(0, m.index) + code.slice(i);
+        re.lastIndex = 0;
+      } else break;
     }
-    if (t.v === ';') { flush(); continue; }
-    if (t.t === TOK.KW && stmtStart.has(t.v) && line.length) flush();
-    if (t.t === TOK.KW && blockClose.has(t.v) && line.length) flush();
-    line.push(t);
-    if (t.t === TOK.KW && blockOpen.has(t.v)) flush();
   }
-  flush();
-
-  // join with smart spacing
-  const spaced = lines => lines.map(toks => {
-    let s = '';
-    for (let i = 0; i < toks.length; i++) {
-      const a = toks[i], b = toks[i+1];
-      s += a.t === TOK.STR ? a.v : a.v;
-      if (!b) continue;
-      if (needsSpace(a, b)) s += ' ';
-    }
-    return s;
-  });
-
-  // indentation
-  const indented = [];
-  let depth = 0;
-  for (const line of spaced(out)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (/^(end|until|else|elseif)\b/.test(trimmed)) depth = Math.max(0, depth - 1);
-    indented.push('  '.repeat(depth) + trimmed);
-    if (/^(else|elseif)\b/.test(trimmed)) depth++;
-    if (/\b(then|do|repeat)\s*$/.test(trimmed)) depth++;
-    if (/^function\b/.test(trimmed) || /\bfunction\b[^)]*\)\s*$/.test(trimmed)) depth++;
-    if (/^local\s+function\b/.test(trimmed) && /\)\s*$/.test(trimmed)) depth++;
-  }
-  return indented.join('\n') + '\n';
+  return code;
 }
 
-function needsSpace(a, b) {
-  // Insert a space between tokens that would lex-merge: id/kw/num next to id/kw/num
-  const isWord = t => t.t === TOK.ID || t.t === TOK.KW || t.t === TOK.NUM;
-  if (isWord(a) && isWord(b)) return true;
-  if (a.t === TOK.OP && b.t === TOK.OP) return true;
-  if (a.v === ',' || a.v === ';') return true;
-  if (a.t === TOK.KW && (b.v === '(' || b.v === '{' || b.t === TOK.STR)) return true;
-  if (isWord(a) && (b.v === '=' || b.v === '..' || b.v === '+' || b.v === '-' || b.v === '*' || b.v === '/')) return true;
-  if ((a.v === '=' || a.v === '..') && (isWord(b) || b.t === TOK.STR || b.v === '(' || b.v === '{')) return true;
-  return false;
+// ==================== BEAUTIFY ====================
+
+function beautify(code) {
+  const tokens = [];
+  let i = 0, inStr = null, buf = '';
+  while (i < code.length) {
+    const c = code[i];
+    if (inStr) {
+      buf += c;
+      if (c === '\\' && i + 1 < code.length) { buf += code[i + 1]; i += 2; continue; }
+      if (c === inStr) { tokens.push({ s: true, v: buf }); buf = ''; inStr = null; }
+      i++; continue;
+    }
+    // long strings
+    const lb = longBracketAt(code, i);
+    if (lb) {
+      if (buf) { tokens.push({ s: false, v: buf }); buf = ''; }
+      const end = longBracketEnd(code, lb.contentStart, lb.level);
+      const stop = end === -1 ? code.length : end + lb.level + 2;
+      tokens.push({ s: true, v: code.slice(i, stop) });
+      i = stop; continue;
+    }
+    if (c === '"' || c === "'") { if (buf) { tokens.push({ s: false, v: buf }); buf = ''; } inStr = c; buf = c; i++; continue; }
+    buf += c; i++;
+  }
+  if (buf) tokens.push({ s: !!inStr, v: buf });
+
+  let joined = '';
+  for (const t of tokens) {
+    if (t.s) joined += t.v;
+    else {
+      let v = t.v;
+      v = v.replace(/;\s*(?=[a-zA-Z_])/g, '\n');
+      v = v.replace(/\b(then|do)\b(?=[ \t]+[a-zA-Z_])/g, '$1\n');
+      v = v.replace(/([^\s])\s+\b(end|else|elseif|until)\b/g, '$1\n$2');
+      joined += v;
+    }
+  }
+
+  const lines = joined.split('\n').map(l => l.trim()).filter(Boolean);
+  const result = [];
+  let indent = 0;
+  for (const l of lines) {
+    if (/^(end\b|else\b|elseif\b|until\b|\}|\))/.test(l)) indent = Math.max(0, indent - 1);
+    result.push('  '.repeat(indent) + l);
+
+    // Decide net indentation increase for this line, avoiding double counting.
+    let inc = 0;
+    // block openers that DON'T close on the same line
+    const opensBlock = /\b(then|do|repeat)\s*$/.test(l) ||
+      (/\bfunction\b/.test(l) && !/\bend\b\s*$/.test(l) && /\)\s*$/.test(l)) ||
+      /\{\s*$/.test(l) || /\(\s*$/.test(l);
+    const isElse = /^(else|elseif)\b/.test(l);
+
+    if (isElse) inc = 1;            // re-indent body after else/elseif (we already dedented the keyword)
+    else if (opensBlock) inc = 1;
+
+    // single-line balanced (e.g. "x = function() return 1 end") => no change
+    if (/\bfunction\b.*\bend\b\s*$/.test(l)) inc = 0;
+    if (/\bif\b.*\bthen\b.*\bend\b/.test(l)) inc = 0;
+
+    indent += inc;
+  }
+  return result.join('\n') + '\n';
+}
+
+// ==================== WEAREDEVS UNPACKER ====================
+
+function isWeAreDevs(code) {
+  return /wearedevs\.net\/obfuscator/i.test(code) ||
+         /--\[\[\s*v\d+\.\d+\.\d+\s+https?:\/\/wearedevs/i.test(code) ||
+         /WEAREDEVS/i.test(code);
+}
+
+function decodeAllEscapesInString(s) {
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < s.length) {
+      const n = s[i + 1];
+      if (/\d/.test(n)) {
+        let num = '', j = i + 1;
+        while (j < s.length && num.length < 3 && /\d/.test(s[j])) { num += s[j]; j++; }
+        const code = parseInt(num, 10);
+        if (code <= 255) { out += String.fromCharCode(code); i = j; continue; }
+      }
+      if (n === 'x' && i + 3 < s.length) {
+        const h = s.slice(i + 2, i + 4);
+        if (/^[0-9a-fA-F]{2}$/.test(h)) { out += String.fromCharCode(parseInt(h, 16)); i += 4; continue; }
+      }
+      if (n === 'n') { out += '\n'; i += 2; continue; }
+      if (n === 't') { out += '\t'; i += 2; continue; }
+      if (n === 'r') { out += '\r'; i += 2; continue; }
+      if (n === 'a') { out += '\x07'; i += 2; continue; }
+      if (n === 'b') { out += '\b'; i += 2; continue; }
+      if (n === 'f') { out += '\f'; i += 2; continue; }
+      if (n === 'v') { out += '\v'; i += 2; continue; }
+      if (n === '\\' || n === '"' || n === "'") { out += n; i += 2; continue; }
+      out += n; i += 2; continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
+function extractWadConstantTable(code) {
+  const declRe = /local\s+(\w+)\s*=\s*\{/g;
+  let m, best = null;
+  while ((m = declRe.exec(code)) !== null) {
+    const open = m.index + m[0].length - 1;
+    const close = findMatchingBrace(code, open);
+    if (close === -1) continue;
+    const body = code.slice(open + 1, close);
+    const strings = [];
+    const re = /"((?:\\\d{1,3}|\\x[0-9a-fA-F]{2}|\\.|[^"\\])*)"/g;
+    let sm;
+    while ((sm = re.exec(body)) !== null) strings.push(decodeAllEscapesInString(sm[1]));
+    if (strings.length >= 2 && (!best || strings.length > best.strings.length)) {
+      best = { name: m[1], strings, raw: body };
+    }
+  }
+  return best;
+}
+
+function unpackWeAreDevs(code) {
+  const result = {
+    detected: false, decoded: null, strings: [], error: null,
+    stats: { totalStrings: 0, base64Decoded: 0, payloadSize: 0, decodedStrings: 0 },
+  };
+  if (!isWeAreDevs(code)) { result.error = 'Not a WeAreDevs script (no header found)'; return result; }
+  result.detected = true;
+
+  const table = extractWadConstantTable(code);
+  if (!table) { result.error = 'Could not find constant table'; return result; }
+
+  result.stats.totalStrings = table.strings.length;
+  result.strings = table.strings;
+
+  const decoded = [];
+  let b64Count = 0;
+  for (const s of table.strings) {
+    const attempts = [];
+    if (/^[A-Za-z0-9+/]+=*$/.test(s) && s.length % 4 === 0) {
+      try {
+        const d = Buffer.from(s, 'base64').toString('latin1');
+        if (printableScore(d) > 0.85) { attempts.push({ method: 'b64', value: d }); b64Count++; }
+      } catch {}
+    }
+    if (printableScore(s) > 0.85) attempts.push({ method: 'raw', value: s });
+    decoded.push(attempts[0] || { method: 'unknown', value: s });
+  }
+  result.stats.base64Decoded = b64Count;
+  result.stats.decodedStrings = decoded.filter(d => d.method !== 'unknown').length;
+
+  const useful = decoded.filter(d => d.method !== 'unknown' && d.value.length >= 4);
+
+  if (useful.length > 10) {
+    const joined = useful.map(d => d.value).join('');
+    if (looksLikeLua(joined)) {
+      result.decoded = beautify(stripComments(joined));
+      result.stats.payloadSize = joined.length;
+      return result;
+    }
+  }
+
+  result.error = `Could not auto-reconstruct payload (custom alphabet likely). Returning ${useful.length} decoded chunks.`;
+  result.strings = useful.map(d => `[${d.method}] ${d.value}`);
+  return result;
 }
 
 // ==================== FINGERPRINTING ====================
 
 function detectObfuscator(code) {
   const hints = [];
-  const sigs = [
+  const sig = [
     [/Luraph|LPH_|lph_/i, 'Luraph'],
     [/Moonsec|MoonSec/i, 'Moonsec'],
     [/Ironbrew|IronBrew/i, 'IronBrew'],
     [/Prometheus/i, 'Prometheus'],
     [/Wynfuscate/i, 'Wynfuscate'],
-    [/wearedevs\.net\/obfuscator/i, 'WeAreDevs'],
+    [/WeAreDevs/i, 'WeAreDevs'],
     [/SynapseXen|Synapse\s*Xen/i, 'Synapse Xen'],
     [/Hercules/i, 'Hercules'],
     [/luaobfuscator\.com/i, 'LuaObfuscator.com'],
+    [/PSU|psu_/i, 'PSU'],
+    [/XENON/i, 'Xenon'],
+    [/v3rmillion|v3rm/i, 'V3rmillion-sourced'],
   ];
-  for (const [r, n] of sigs) if (r.test(code)) hints.push(n);
-
+  for (const [re, name] of sig) if (re.test(code)) hints.push(name);
   if ((code.match(/\\x[0-9a-f]{2}/gi) || []).length > 20) hints.push('hex-encoded strings');
   if ((code.match(/string\.char\s*\(\s*\d+/g) || []).length > 5) hints.push('string.char encoding');
   if (/load(?:string)?\s*\(\s*["']/.test(code)) hints.push('loadstring wrapper');
   if ((code.match(/bit32\.(bxor|band|bor)/g) || []).length > 5) hints.push('bitwise obfuscation');
   if (/while\s+true\s+do[\s\S]{0,200}if\s+\w+\s*==\s*\d+\s+then/.test(code)) hints.push('VM-style dispatcher');
   if ((code.match(/_0x[0-9a-f]{4,}/gi) || []).length > 10) hints.push('hex-mangled identifiers');
-  return hints;
-}
-
-// ==================== WEAREDEVS DEDICATED UNPACKER ====================
-
-function unpackWeAreDevs(code) {
-  const result = {
-    detected: false, decoded: null, strings: [], error: null,
-    stats: { totalStrings: 0, base64Decoded: 0, payloadSize: 0 },
-  };
-  if (!/wearedevs\.net\/obfuscator/i.test(code) && !/--\[\[\s*v\d+\.\d+\.\d+\s+https?:\/\/wearedevs/i.test(code)) {
-    result.error = 'Not a WeAreDevs script'; return result;
-  }
-  result.detected = true;
-
-  // pull all string literals (decoded) in source order
-  const tokens = lex(code);
-  const strings = [];
-  for (const t of tokens) {
-    if (t.t === TOK.STR) strings.push(decodeStrEscapes(t.body));
-    else if (t.t === TOK.LSTR) strings.push(t.body);
-  }
-  result.stats.totalStrings = strings.length;
-
-  // try base64-decoding everything that looks like base64
-  const decoded = strings.map(s => {
-    if (/^[A-Za-z0-9+/]+=*$/.test(s) && s.length % 4 === 0 && s.length >= 4) {
-      try {
-        const d = Buffer.from(s, 'base64').toString('utf-8');
-        if (printableScore(d) > 0.85) { result.stats.base64Decoded++; return d; }
-      } catch { /* */ }
-    }
-    return s;
-  }).filter(s => s.length >= 4);
-
-  // assemble candidate payloads: try (a) concatenation of all, (b) longest single
-  const candidates = [
-    decoded.join(''),
-    decoded.join('\n'),
-    decoded.slice().sort((a, b) => b.length - a.length)[0] || '',
-  ];
-
-  for (const c of candidates) {
-    if (looksLikeLua(c)) {
-      const r = runPipeline(c);
-      result.decoded = r.code;
-      result.stats.payloadSize = c.length;
-      return result;
-    }
-  }
-
-  result.error = 'Could not reconstruct payload — returning decoded chunks';
-  result.strings = decoded;
-  return result;
+  if ((code.match(/[Il1O0]{5,}/g) || []).length > 10) hints.push('homoglyph identifiers (Il1O0)');
+  if (/\\u\{[0-9a-fA-F]+\}/.test(code)) hints.push('unicode escape encoding');
+  if (/getfenv|setfenv/.test(code)) hints.push('environment manipulation');
+  return [...new Set(hints)];
 }
 
 // ==================== SANDBOX ====================
@@ -994,94 +864,170 @@ function sandboxExecute(code) {
   const L = lauxlib.luaL_newstate();
   lualib.luaL_openlibs(L);
 
-  // Hook load/loadstring: capture chunk text AND execute the chunk so payloads run.
-  const hookLoad = (L2) => {
-    if (lua.lua_isstring(L2, 1)) {
-      const s = lua.lua_tojsstring(L2, 1);
+  // Capture loadstring/load payloads. Return a stub callable that captures recursively.
+  const captureLoad = (Ls) => {
+    if (lua.lua_isstring(Ls, 1)) {
+      const s = lua.lua_tojsstring(Ls, 1);
       if (s && s.length > 5) captured.push({ type: 'load', value: s });
-      // Compile and push real function so caller can invoke payload normally.
-      const status = lauxlib.luaL_loadstring(L2, to_luastring(s));
-      if (status !== lua.LUA_OK) {
-        lua.lua_pop(L2, 1);
-        lua.lua_pushjsfunction(L2, () => 0);
-      }
-    } else {
-      lua.lua_pushjsfunction(L2, () => 0);
     }
-    return 1;
+    lua.lua_pushjsfunction(Ls, () => 0); // chunk stub
+    lua.lua_pushnil(Ls);                 // no error
+    return 2;                            // mimic load() returning func, err
   };
-  lua.lua_pushjsfunction(L, hookLoad); lua.lua_setglobal(L, to_luastring('loadstring'));
-  lua.lua_pushjsfunction(L, hookLoad); lua.lua_setglobal(L, to_luastring('load'));
 
-  // Strip dangerous globals
-  for (const name of ['os', 'io', 'require', 'dofile', 'loadfile', 'package', 'debug']) {
+  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('loadstring'));
+  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('load'));
+
+  for (const name of ['os', 'io', 'require', 'dofile', 'loadfile', 'package']) {
     lua.lua_pushnil(L); lua.lua_setglobal(L, to_luastring(name));
   }
 
-  // Capture print
-  lua.lua_pushjsfunction(L, (L2) => {
-    const n = lua.lua_gettop(L2);
+  lua.lua_pushjsfunction(L, (Ls) => {
+    const n = lua.lua_gettop(Ls);
     const parts = [];
     for (let i = 1; i <= n; i++) {
-      if (lua.lua_isstring(L2, i)) parts.push(lua.lua_tojsstring(L2, i));
-      else parts.push(String(lua.lua_tonumber(L2, i)));
+      if (lua.lua_isstring(Ls, i)) parts.push(lua.lua_tojsstring(Ls, i));
+      else parts.push(String(lua.lua_tonumber(Ls, i)));
     }
     captured.push({ type: 'print', value: parts.join('\t') });
     return 0;
   });
   lua.lua_setglobal(L, to_luastring('print'));
 
-  // Fake Roblox globals so scripts don't crash on `game.Players`, etc.
   const fakeGame = `
-    local mt
-    mt = {
-      __index = function() return setmetatable({}, mt) end,
-      __call = function() return setmetatable({}, mt) end,
-      __newindex = function() end,
-      __tostring = function() return "fake" end,
-    }
-    local fake = function() return setmetatable({}, mt) end
-    game, workspace, script = fake(), fake(), fake()
-    Players, ReplicatedStorage, RunService, UserInputService = fake(), fake(), fake(), fake()
-    wait, spawn, delay, task = function() end, function() end, function() end, fake()
-    tick, os = function() return 0 end, { time = function() return 0 end, clock = function() return 0 end, date = function() return "" end }
-    Instance = setmetatable({ new = function() return setmetatable({}, mt) end }, mt)
-    Color3 = setmetatable({ new = function() return setmetatable({}, mt) end, fromRGB = function() return setmetatable({}, mt) end }, mt)
-    Vector3 = setmetatable({ new = function() return setmetatable({}, mt) end }, mt)
-    CFrame = setmetatable({ new = function() return setmetatable({}, mt) end }, mt)
-    Enum = setmetatable({}, mt)
+    local mt; mt = {__index = function(t,k) return setmetatable({}, mt) end,
+                __call = function(t, ...) return setmetatable({}, mt) end,
+                __newindex = function(t,k,v) end,
+                __concat = function() return "" end,
+                __tostring = function() return "" end}
+    game = setmetatable({}, mt)
+    workspace = setmetatable({}, mt)
+    script = setmetatable({}, mt)
+    Game = game
+    Workspace = workspace
+    wait = function() return 0 end
+    spawn = function(f) end
+    delay = function(t,f) end
+    tick = function() return 0 end
+    task = setmetatable({wait=function() return 0 end, spawn=function() end, defer=function() end}, mt)
+    Instance = setmetatable({new = function() return setmetatable({}, mt) end}, mt)
+    getfenv = function() return setmetatable({}, mt) end
+    setfenv = function(f) return f end
   `;
-  lauxlib.luaL_dostring(L, to_luastring(fakeGame));
+  const harnessStatus = lauxlib.luaL_dostring(L, to_luastring(fakeGame));
+  const harnessErr = harnessStatus !== lua.LUA_OK ? lua.lua_tojsstring(L, -1) : null;
+  if (harnessErr) lua.lua_pop(L, 1);
 
-  // Instruction-count-based timeout
   const start = Date.now();
+  let timedOut = false;
   lua.lua_sethook(L, () => {
     if (Date.now() - start > SANDBOX_TIMEOUT_MS) {
+      timedOut = true;
       lauxlib.luaL_error(L, to_luastring('sandbox timeout'));
     }
-  }, lua.LUA_MASKCOUNT, 100000);
+  }, lua.LUA_MASKCOUNT, SANDBOX_HOOK_COUNT);
 
   try {
     const status = lauxlib.luaL_dostring(L, to_luastring(code));
     if (status !== lua.LUA_OK) {
       const err = lua.lua_tojsstring(L, -1) || 'unknown error';
-      return { available: true, captured, error: err };
+      return { available: true, captured, error: timedOut ? 'sandbox timeout (8s)' : err, harnessErr };
     }
-    return { available: true, captured, error: null };
+    return { available: true, captured, error: null, harnessErr };
   } catch (e) {
-    return { available: true, captured, error: e.message };
+    return { available: true, captured, error: timedOut ? 'sandbox timeout (8s)' : e.message, harnessErr };
   }
+}
+
+// ==================== PIPELINE ====================
+
+function decodeFull(code) {
+  const deadline = new Deadline(PIPELINE_BUDGET_MS);
+  const stats = {
+    originalSize: code.length, passes: 0, layers: 0,
+    xorDecoded: 0, posXorDecoded: 0, caesarDecoded: 0, base64Decoded: 0,
+    reversedDecoded: 0, rot13Decoded: 0, renamed: 0, finalSize: 0, truncated: false,
+  };
+
+  code = stripComments(code);
+
+  let prev;
+  do {
+    prev = code;
+    code = decodeHex(code);
+    code = decodeDecimal(code);
+    code = decodeUnicode(code);
+    code = decodeStringChar(code);
+
+    const b64 = decodeBase64Strings(code); code = b64.code; stats.base64Decoded += b64.count;
+
+    code = foldConcat(code);
+    code = foldArithmetic(code);
+    code = foldBitLib(code);
+    code = resolveConstantTables(code);
+    code = inlineTrivialFunctions(code);
+    code = propagateStringConstants(code);
+
+    const unwrap = unwrapLoadstrings(code);
+    code = unwrap.code; stats.layers += unwrap.layers;
+
+    stats.passes++;
+    if (deadline.expired()) { stats.truncated = true; break; }
+  } while (code !== prev && stats.passes < 12);
+
+  if (!deadline.expired()) {
+    const xorResult = bruteXorStrings(code, deadline);
+    code = xorResult.code; stats.xorDecoded = xorResult.count;
+  }
+  if (!deadline.expired()) {
+    const posXor = brutePositionalXorStrings(code, deadline);
+    code = posXor.code; stats.posXorDecoded = posXor.count;
+  }
+  if (!deadline.expired()) {
+    const caesarResult = bruteCaesarStrings(code, deadline);
+    code = caesarResult.code; stats.caesarDecoded = caesarResult.count;
+  }
+  if (!deadline.expired()) {
+    const revResult = tryReverseStrings(code);
+    code = revResult.code; stats.reversedDecoded = revResult.count;
+  }
+  if (!deadline.expired()) {
+    const rotResult = tryRot13Strings(code);
+    code = rotResult.code; stats.rot13Decoded = rotResult.count;
+  }
+  if (deadline.expired()) stats.truncated = true;
+
+  code = foldConcat(code);
+  code = resolveConstantTables(code);
+  const unwrap2 = unwrapLoadstrings(code);
+  code = unwrap2.code; stats.layers += unwrap2.layers;
+
+  const rename = renameUglyIdentifiers(code);
+  code = rename.code; stats.renamed = rename.renamed;
+
+  code = removeDeadCode(code);
+  code = beautify(code);
+
+  stats.finalSize = code.length;
+  return { code, stats };
 }
 
 // ==================== EXTRACTORS ====================
 
 function extractStrings(code) {
   const found = [];
-  for (const t of lex(code)) {
-    if (t.t === TOK.STR) {
-      const d = decodeStrEscapes(t.body);
-      if (d.length >= 4) found.push(d);
-    } else if (t.t === TOK.LSTR && t.body.length >= 4) found.push(t.body);
+  walkStrings(code, b => { if (b.length >= 4) found.push(b); return b; });
+  // also pull long strings
+  let i = 0;
+  while (i < code.length) {
+    const lb = longBracketAt(code, i);
+    if (lb) {
+      const end = longBracketEnd(code, lb.contentStart, lb.level);
+      const stop = end === -1 ? code.length : end;
+      const body = code.slice(lb.contentStart, stop);
+      if (body.length >= 4) found.push(body);
+      i = stop + lb.level + 2;
+    } else i++;
   }
   return [...new Set(found)];
 }
@@ -1093,19 +1039,22 @@ function extractURLs(code) {
 
 function extractLoadstrings(code) {
   const out = [];
-  const tokens = lex(code);
-  for (let i = 0; i < tokens.length - 3; i++) {
-    const t = tokens[i];
-    if (t.t !== TOK.ID || (t.v !== 'load' && t.v !== 'loadstring')) continue;
-    const lp = nextNonTrivia(tokens, i); if (!lp.tok || lp.tok.v !== '(') continue;
-    const arg = nextNonTrivia(tokens, lp.idx); if (!arg.tok) continue;
-    if (arg.tok.t === TOK.STR) out.push(decodeStrEscapes(arg.tok.body));
-    else if (arg.tok.t === TOK.LSTR) out.push(arg.tok.body);
-  }
+  const re = /load(?:string)?\s*\(\s*(["'])([\s\S]+?)\1\s*\)/g;
+  let m;
+  while ((m = re.exec(code)) !== null) out.push(m[2]);
   return out;
 }
 
-// ==================== I/O ====================
+// NEW: pull Roblox asset/script ids and common webhook patterns.
+function extractIndicators(code) {
+  return {
+    webhooks: [...new Set(code.match(/https?:\/\/(?:discord(?:app)?\.com|ptb\.discord\.com)\/api\/webhooks\/\S+/gi) || [])],
+    rbxassets: [...new Set(code.match(/rbxassetid:\/\/\d+|rbxasset:\/\/\S+/gi) || [])],
+    httpcalls: [...new Set(code.match(/\b(HttpGet|HttpGetAsync|HttpPost|request|http_request|syn\.request)\b/g) || [])],
+  };
+}
+
+// ==================== SOURCE / OUTPUT ====================
 
 async function getSource(interaction) {
   const code = interaction.options.getString('code');
@@ -1114,9 +1063,9 @@ async function getSource(interaction) {
 
   if (file) {
     if (!/\.(lua|luau|txt)$/i.test(file.name || '')) return { error: 'File must be .lua, .luau, or .txt' };
-    if (file.size > MAX_BYTES) return { error: `File too large (${(file.size/1024/1024).toFixed(2)} MB)` };
+    if (file.size > MAX_BYTES) return { error: `File too large (${(file.size / 1024 / 1024).toFixed(2)} MB, max ${(MAX_BYTES / 1024 / 1024).toFixed(2)} MB)` };
     try {
-      const res = await fetch(file.url);
+      const res = await fetch(file.url, { signal: AbortSignal.timeout(15000) });
       if (!res.ok) return { error: `Fetch failed: ${res.status}` };
       return { code: await res.text() };
     } catch (e) { return { error: `Attachment fetch failed: ${e.message}` }; }
