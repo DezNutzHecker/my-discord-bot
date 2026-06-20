@@ -168,13 +168,17 @@ function bruteXorStrings(code) {
   let count = 0;
   const result = walkStrings(code, b => {
     if (b.length < 16 || b.length > 50000) return b;
-    if (printableScore(b) > 0.9 && looksLikeLua(b)) return b;
+    // Skip anything already printable - don't risk wrecking valid strings
+    if (printableScore(b) > 0.85) return b;
+    // Skip anything that has any printable letter sequence - likely valid plain text
+    if (/[a-zA-Z]{4,}/.test(b) && printableScore(b) > 0.7) return b;
     let best = null;
     for (let k = 1; k < 256; k++) {
       let decoded = '';
       for (let i = 0; i < b.length; i++) decoded += String.fromCharCode(b.charCodeAt(i) ^ k);
       const score = printableScore(decoded);
-      if (score > 0.95 && /[a-zA-Z]{3,}/.test(decoded)) {
+      // Require both high printability AND Lua-like content
+      if (score > 0.97 && looksLikeLua(decoded)) {
         if (!best || score > best.score) best = { decoded, score };
       }
     }
@@ -183,7 +187,6 @@ function bruteXorStrings(code) {
   });
   return { code: result, count };
 }
-
 function bruteCaesarStrings(code) {
   let count = 0;
   const result = walkStrings(code, b => {
