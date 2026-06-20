@@ -349,12 +349,31 @@ function inlineTrivialFunctions(code) {
 function unwrapLoadstrings(code, max = 12) {
   let layers = 0;
   for (let i = 0; i < max; i++) {
-    const m = code.match(/load(?:string)?\s*\(\s*(["'])((?:\\.|(?!\1)[^\\])+)\1\s*\)\s*\(\s*\)/);
-    if (!m) break;
-    const inner = decodeUnicode(decodeHex(decodeDecimal(m[2])));
-    if (inner === m[2] || inner.length < 5) break;
-    code = code.replace(m[0], inner);
-    layers++;
+    // Match loadstring("..." or loadstring(varname) followed by ()
+    const stringArg = code.match(/load(?:string)?\s*\(\s*(["'])((?:\\.|(?!\1)[^\\])+)\1\s*\)\s*\(\s*\)/);
+    if (stringArg) {
+      const inner = decodeUnicode(decodeHex(decodeDecimal(stringArg[2])));
+      if (inner === stringArg[2] || inner.length < 5) break;
+      code = code.replace(stringArg[0], inner);
+      layers++;
+      continue;
+    }
+    // Match loadstring(variable)() — try to resolve the variable
+    const varArg = code.match(/load(?:string)?\s*\(\s*(\w+)\s*\)\s*\(\s*\)/);
+    if (varArg) {
+      const varName = varArg[1];
+      const defRe = new RegExp(`\\blocal\\s+${escRe(varName)}\\s*=\\s*(["'])((?:\\\\.|(?!\\1)[^\\\\])+)\\1`);
+      const defMatch = code.match(defRe);
+      if (defMatch) {
+        const inner = decodeUnicode(decodeHex(decodeDecimal(defMatch[2])));
+        if (inner.length > 5) {
+          code = code.replace(varArg[0], inner);
+          layers++;
+          continue;
+        }
+      }
+    }
+    break;
   }
   return { code, layers };
 }
