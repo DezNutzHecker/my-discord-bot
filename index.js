@@ -600,18 +600,69 @@ function sandboxExecute(code) {
   const L = lauxlib.luaL_newstate();
   lualib.luaL_openlibs(L);
 
-  // Replace dangerous globals
-  const noop = () => 0;
-
-  // Hook loadstring/load to capture payloads
+  // Hook loadstring/load: capture payload AND return a fake function so chained () doesn't blow up
   const captureLoad = (L) => {
     if (lua.lua_isstring(L, 1)) {
       const s = lua.lua_tojsstring(L, 1);
-      if (s && s.length > 10) captured.push({ type: 'load', value: s });
+      if (s && s.length > 5) captured.push({ type: 'load', value: s });
     }
-    lua.lua_pushnil(L);
+    lua.lua_pushjsfunction(L, (L2) => 0);
     return 1;
   };
+
+  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('loadstring'));
+  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('load'));
+
+  const block = ['os', 'io', 'require', 'dofile', 'loadfile', 'package'];
+  for (const name of block) {
+    lua.lua_pushnil(L); lua.lua_setglobal(L, to_luastring(name));
+  }
+
+  lua.lua_pushjsfunction(L, (L) => {
+    const n = lua.lua_gettop(L);
+    const parts = [];
+    for (let i = 1; i <= n; i++) {
+      if (lua.lua_isstring(L, i)) parts.push(lua.lua_tojsstring(L, i));
+      else parts.push(String(lua.lua_tonumber(L, i)));
+    }
+    captured.push({ type: 'print', value: parts.join('\t') });
+    return 0;
+  });
+  lua.lua_setglobal(L, to_luastring('print'));
+
+  const fakeGame = `
+    local mt = {__index = function(t,k) return setmetatable({}, getmetatable(t)) end,
+                __call = function(t, ...) return setmetatable({}, getmetatable(t)) end,
+                __newindex = function(t,k,v) end}
+    game = setmetatable({}, mt)
+    workspace = setmetatable({}, mt)
+    script = setmetatable({}, mt)
+    wait = function() end
+    spawn = function(f) end
+    delay = function(t,f) end
+    tick = function() return 0 end
+    Instance = setmetatable({new = function() return setmetatable({}, mt) end}, mt)
+  `;
+  lauxlib.luaL_dostring(L, to_luastring(fakeGame));
+
+  const start = Date.now();
+  lua.lua_sethook(L, () => {
+    if (Date.now() - start > SANDBOX_TIMEOUT_MS) {
+      lauxlib.luaL_error(L, to_luastring('sandbox timeout'));
+    }
+  }, lua.LUA_MASKCOUNT, 1000000);
+
+  try {
+    const status = lauxlib.luaL_dostring(L, to_luastring(code));
+    if (status !== lua.LUA_OK) {
+      const err = lua.lua_tojsstring(L, -1) || 'unknown error';
+      return { available: true, captured, error: err };
+    }
+    return { available: true, captured, error: null };
+  } catch (e) {
+    return { available: true, captured, error: e.message };
+  }
+}
 
   lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('loadstring'));
   lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('load'));
