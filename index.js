@@ -414,6 +414,14 @@ function beautify(code) {
       if (c === inStr) { tokens.push({ s: true, v: buf }); buf = ''; inStr = null; }
       i++; continue;
     }
+    // Long-bracket strings [[ ... ]]
+    if (c === '[' && code[i+1] === '[') {
+      if (buf) { tokens.push({ s: false, v: buf }); buf = ''; }
+      const end = code.indexOf(']]', i + 2);
+      if (end === -1) { buf += code.slice(i); i = code.length; continue; }
+      tokens.push({ s: true, v: code.slice(i, end + 2) });
+      i = end + 2; continue;
+    }
     if (c === '"' || c === "'") { if (buf) { tokens.push({ s: false, v: buf }); buf = ''; } inStr = c; buf = c; i++; continue; }
     buf += c; i++;
   }
@@ -423,12 +431,29 @@ function beautify(code) {
   for (const t of tokens) {
     if (t.s) joined += t.v;
     else {
-      let v = t.v.replace(/;/g, '\n');
-      v = v.replace(/\b(then|do)\b/g, '$1\n');
-      v = v.replace(/\b(end|else|elseif|until)\b/g, '\n$1');
+      let v = t.v;
+      // Only split on `;` if it's clearly a statement separator (not in a for-loop header etc)
+      v = v.replace(/;\s*(?=[a-zA-Z_])/g, '\n');
+      // Add newline AFTER then/do only if followed by non-whitespace, non-newline
+      v = v.replace(/\b(then|do)\b(?=[ \t]+[a-zA-Z_])/g, '$1\n');
+      // Add newline BEFORE end/else/elseif/until when preceded by content
+      v = v.replace(/([^\s])\s+\b(end|else|elseif|until)\b/g, '$1\n$2');
       joined += v;
     }
   }
+
+  const lines = joined.split('\n').map(l => l.trim()).filter(Boolean);
+  const result = [];
+  let indent = 0;
+  for (const l of lines) {
+    if (/^(end\b|else\b|elseif\b|until\b)/.test(l)) indent = Math.max(0, indent - 1);
+    result.push('  '.repeat(indent) + l);
+    if (/\b(then|do|repeat|else)\s*$/.test(l)) indent++;
+    if (/\bfunction\b[^)]*\)\s*$/.test(l)) indent++;
+    if (/^(else|elseif)\b/.test(l)) indent++;
+  }
+  return result.join('\n') + '\n';
+}
 
   const lines = joined.split('\n').map(l => l.trim()).filter(Boolean);
   const result = [];
