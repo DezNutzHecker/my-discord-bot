@@ -849,6 +849,7 @@ async function startBot() {
             { name: '/extract', value: 'Pull strings, URLs, and loadstring payloads' },
             { name: '/detect', value: 'Identify which obfuscator was used' },
             { name: '/sandbox', value: 'Run the script in a sandboxed Lua VM and capture loadstring/print payloads' },
+            { name: '/wad', value: 'Fast dedicated WeAreDevs unpacker (much faster than /sandbox for WAD scripts)' },
           )
           .setFooter({ text: `Max input: ${(MAX_BYTES/1024/1024).toFixed(2)} MB. Each command accepts code, file, or url.` });
         return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
@@ -922,7 +923,10 @@ async function startBot() {
           lines.push(e.value);
           lines.push('');
         }
-              if (cmd === 'wad') {
+        return sendOutput(interaction, lines.join('\n'), 'sandbox.lua');
+      }
+
+      if (cmd === 'wad') {
         const result = unpackWeAreDevs(src.code);
 
         if (!result.detected) {
@@ -944,9 +948,6 @@ async function startBot() {
         const dump = header + `-- Could not reconstruct payload. Raw strings:\n\n` +
           result.strings.map((s, i) => `[${i+1}] ${JSON.stringify(s).slice(0, 300)}`).join('\n');
         return sendOutput(interaction, dump, 'wad-strings.txt');
-      }
-
-        return sendOutput(interaction, lines.join('\n'), 'sandbox.lua');
       }
     } catch (err) {
       console.error(err);
