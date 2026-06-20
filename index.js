@@ -922,6 +922,30 @@ async function startBot() {
           lines.push(e.value);
           lines.push('');
         }
+              if (cmd === 'wad') {
+        const result = unpackWeAreDevs(src.code);
+
+        if (!result.detected) {
+          return interaction.editReply('Not a WeAreDevs script. Try `/decode` for generic deobfuscation.');
+        }
+
+        const header =
+          `-- WeAreDevs Unpacker\n` +
+          `-- Strings in table: ${result.stats.totalStrings}\n` +
+          `-- Base64-decodable: ${result.stats.base64Decoded}\n` +
+          `-- Payload size: ${(result.stats.payloadSize/1024).toFixed(2)} KB\n` +
+          (result.error ? `-- Note: ${result.error}\n` : '') +
+          `\n`;
+
+        if (result.decoded) {
+          return sendOutput(interaction, header + result.decoded, 'wad-unpacked.lua');
+        }
+
+        const dump = header + `-- Could not reconstruct payload. Raw strings:\n\n` +
+          result.strings.map((s, i) => `[${i+1}] ${JSON.stringify(s).slice(0, 300)}`).join('\n');
+        return sendOutput(interaction, dump, 'wad-strings.txt');
+      }
+
         return sendOutput(interaction, lines.join('\n'), 'sandbox.lua');
       }
     } catch (err) {
