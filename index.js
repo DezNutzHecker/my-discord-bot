@@ -544,9 +544,8 @@ function unpackWeAreDevs(code) {
     detected: false,
     decoded: null,
     strings: [],
-    joinedPayload: null,
     error: null,
-    stats: { totalStrings: 0, base64Decoded: 0, payloadSize: 0 },
+    stats: { totalStrings: 0, base64Decoded: 0, payloadSize: 0, decodedStrings: 0 },
   };
 
   if (!isWeAreDevs(code)) {
@@ -564,15 +563,44 @@ function unpackWeAreDevs(code) {
   result.stats.totalStrings = table.strings.length;
   result.strings = table.strings;
 
-  // Try base64 on each string
+  // Decode every string with every method we know, keep what works
+  const decoded = [];
   let b64Count = 0;
-  const b64Decoded = [];
   for (const s of table.strings) {
-    const dec = tryBase64Decode(s);
-    if (dec) { b64Decoded.push(dec); b64Count++; }
-    else b64Decoded.push(null);
+    const attempts = [];
+    // Standard base64
+    if (/^[A-Za-z0-9+/]+=*$/.test(s) && s.length % 4 === 0) {
+      try {
+        const d = Buffer.from(s, 'base64').toString('utf-8');
+        if (printableScore(d) > 0.85) { attempts.push({ method: 'b64', value: d }); b64Count++; }
+      } catch {}
+    }
+    // Raw printable
+    if (printableScore(s) > 0.85) attempts.push({ method: 'raw', value: s });
+    decoded.push(attempts[0] || { method: 'unknown', value: s });
   }
   result.stats.base64Decoded = b64Count;
+  result.stats.decodedStrings = decoded.filter(d => d.method !== 'unknown').length;
+
+  // WAD format note - the interpreter at the bottom uses these chunks
+  // For now, dump useful chunks the user can inspect
+  const useful = decoded.filter(d => d.method !== 'unknown' && d.value.length >= 4);
+
+  if (useful.length > 10) {
+    // Try joining b64-decoded chunks - sometimes works for simpler WAD variants
+    const joined = useful.map(d => d.value).join('');
+    if (looksLikeLua(joined)) {
+      result.decoded = beautify(stripComments(joined));
+      result.stats.payloadSize = joined.length;
+      return result;
+    }
+  }
+
+  // Couldn't reconstruct - return useful info instead of fake success
+  result.error = `Unpacker could not auto-reconstruct payload. Custom alphabet likely in use. Returning ${useful.length} decoded chunks for analysis.`;
+  result.strings = useful.map(d => `[${d.method}] ${d.value}`);
+  return result;
+}
 
   // WAD typically concatenates all strings into one payload
   // Strategy 1: join all decoded strings if most look like b64
