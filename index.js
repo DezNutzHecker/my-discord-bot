@@ -99,7 +99,7 @@ function printableScore(s) {
 }
 
 function looksLikeLua(s) {
-  const kw = /\b(local|function|end|if|then|else|return|for|while|do|repeat|until|elseif)\b/g;
+  const LUA_KEYWORDS = new Set(['and','break','do','else','elseif','end','false','for','function','goto','if','in','local','nil','not','or','repeat','return','then','true','until','while']);
   const matches = s.match(kw);
   return matches && matches.length >= 2;
 }
