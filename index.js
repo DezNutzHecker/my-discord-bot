@@ -976,8 +976,8 @@ async function startBot() {
       const src = await getSource(interaction);
       if (src.error) return interaction.editReply(src.error);
 
-      const key = hashOf(cmd + ':' + src.code);
-      const cached = cache.get(key);
+      const fingerprint = src.code.length + ':' + src.code.slice(0, 512) + ':' + src.code.slice(-512);
+      const key = hashOf(cmd + ':' + fingerprint);
 
       if (cmd === 'beautify') {
         let out;
