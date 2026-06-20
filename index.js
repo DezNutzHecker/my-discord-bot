@@ -131,13 +131,13 @@ function decodeStringChar(code) {
   let prev;
   do {
     prev = code;
-    code = code.replace(/string\.char\s*\(([^()]+)\)/g, (m, args) => {
+    // Match string.char with only numeric args (skip nested expressions)
+    code = code.replace(/string\.char\s*\(\s*((?:-?\d+\s*,\s*)*-?\d+)\s*\)/g, (m, args) => {
       const parts = args.split(',').map(s => s.trim());
-      if (!parts.every(p => /^-?\d+$/.test(p))) return m;
       try {
         const chars = parts.map(p => {
           const n = parseInt(p, 10);
-          if (n < 0 || n > 255) throw new Error();
+          if (isNaN(n) || n < 0 || n > 255) throw new Error();
           return String.fromCharCode(n);
         });
         return `"${escapeLua(chars.join(''))}"`;
