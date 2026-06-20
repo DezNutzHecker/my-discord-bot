@@ -191,7 +191,8 @@ function bruteCaesarStrings(code) {
   let count = 0;
   const result = walkStrings(code, b => {
     if (b.length < 16 || b.length > 10000) return b;
-    if (printableScore(b) > 0.9) return b;
+    if (printableScore(b) > 0.85) return b;
+    if (/[a-zA-Z]{4,}/.test(b) && printableScore(b) > 0.7) return b;
     let best = null;
     for (let off = 1; off < 128; off++) {
       let decoded = '';
@@ -199,7 +200,7 @@ function bruteCaesarStrings(code) {
         decoded += String.fromCharCode((b.charCodeAt(i) - off + 256) % 256);
       }
       const score = printableScore(decoded);
-      if (score > 0.97 && /[a-zA-Z]{3,}/.test(decoded)) {
+      if (score > 0.97 && looksLikeLua(decoded)) {
         if (!best || score > best.score) best = { decoded, score };
       }
     }
