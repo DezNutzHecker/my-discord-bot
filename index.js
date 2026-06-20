@@ -197,7 +197,7 @@ async function getSource(interaction) {
     } catch (e) { return { error: `URL fetch failed: ${e.message}` }; }
   }
   if (code) return { code: code.replace(/\\n/g, '\n').replace(/\\t/g, '\t') };
-  return { error: 'Provide `code`, `file`, or `url`' };
+  return { error: 'Provide code, file, or url' };
 }
 
 async function sendOutput(interaction, content, filename) {
@@ -206,7 +206,7 @@ async function sendOutput(interaction, content, filename) {
   }
   const buf = Buffer.from(content, 'utf-8');
   return interaction.editReply({
-    content: `📦 Output (${(buf.length/1024).toFixed(1)} KB)`,
+    content: `Output (${(buf.length/1024).toFixed(1)} KB)`,
     files: [new AttachmentBuilder(buf, { name: filename })],
   });
 }
@@ -305,101 +305,3 @@ if (process.argv[2] === 'register') {
 } else {
   startBot();
 }
-Commit.
-
-Step 3: Repo should look like exactly this
-.gitignore
-index.js
-package.json
-Three files. Nothing else. If there's anything else, delete it.
-
-Step 4: In Termux, delete the old folder and re-clone
-cd ~
-rm -rf my-discord-bot
-git clone https://github.com/DezNutzHecker/my-discord-bot.git
-cd my-discord-bot
-ls
-ls should show exactly index.js package.json (the .gitignore is hidden).
-
-Step 5: Make your .env
-nano .env
-Paste, fill in real values:
-
-DISCORD_TOKEN=your_bot_token_here
-CLIENT_ID=your_application_id_here
-GUILD_ID=your_server_id_here
-Save: hold Volume Down + O, press Enter, then Volume Down + X.
-
-Step 6: Install + run
-npm install
-node index.js register
-node index.js
-You should see Online as YourBot#1234. Done.
-
-Do Step 1 first (delete the repo, recreate empty). Tell me when that's done and I'll guide you through the rest. If anything errors, paste the message and which step.
-
-stagedplays_02
-can we add read me so it shows the actual uhhh thing it says all comands and explains what they do?
-Claude Opus 4.7
-Yeah, easy. Add a 4th file to your repo:
-
-File 4: README.md
-# Lua Bot
-
-A Discord bot for working with Lua scripts. Beautifies messy code, decodes common obfuscation tricks, and extracts useful info like URLs and strings.
-
-## Commands
-
-### `/help`
-Shows the command list inside Discord.
-
-### `/beautify`
-Cleans up Lua formatting. Adds proper indentation, splits statements onto their own lines, and makes the code readable.
-
-**Use when:** you have minified or single-line Lua you want to read.
-
-### `/decode`
-Runs a decoding pass on the script:
-- Decodes `\xNN` hex escapes inside strings
-- Decodes `\NNN` decimal escapes inside strings
-- Evaluates `string.char(72, 105)` into `"Hi"`
-- Folds string concatenations like `"foo" .. "bar"` into `"foobar"`
-- Runs multiple passes until nothing changes
-- Beautifies the result at the end
-
-**Use when:** a script hides strings using char codes or escapes.
-
-### `/extract`
-Pulls useful info out of the script and returns a report:
-- All URLs (`http://` and `https://`)
-- All `loadstring(...)` payloads
-- All string literals 4+ characters long (deduplicated, first 200 shown)
-
-**Use when:** you want to see what a script connects to or what data it carries, without reading the whole thing.
-
-## Command inputs
-
-Every command (except `/help`) accepts one of three input methods:
-
-| Option | What it does |
-|--------|--------------|
-| `code` | Paste Lua directly into the command |
-| `file` | Upload a `.lua`, `.luau`, or `.txt` file |
-| `url`  | Provide a raw URL the bot will fetch |
-
-Max input size: 500 KB.
-
-## Setup
-
-1. `npm install`
-2. Create a `.env` file with `DISCORD_TOKEN`, `CLIENT_ID`, and `GUILD_ID`
-3. `node index.js register` — registers the slash commands (run once)
-4. `node index.js` — starts the bot
-
-## What this bot does NOT do
-
-- Crack heavy VM-based obfuscators like Luraph v14 or Moonsec v3 — those require dedicated reverse-engineering tools
-- Execute Lua code in a sandbox
-- Recover original variable names or comments (they're gone once obfuscated)
-
-This is a fast, lightweight toolkit for common cases — not a full deobfuscator suite.
