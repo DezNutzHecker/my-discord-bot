@@ -13,8 +13,10 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
   process.exit(1);
 }
 
-const MAX_BYTES = 500_000;
+const MAX_BYTES = 5_000_000;
 const MAX_INLINE = 1900;
+
+// ==================== HELPERS ====================
 
 function escapeLua(s) {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
@@ -56,6 +58,18 @@ function stripComments(code) {
   return out;
 }
 
+function printableScore(s) {
+  if (!s.length) return 0;
+  let p = 0;
+  for (const c of s) {
+    const x = c.charCodeAt(0);
+    if (x === 9 || x === 10 || x === 13 || (x >= 32 && x <= 126)) p++;
+  }
+  return p / s.length;
+}
+
+// ==================== DECODERS ====================
+
 function decodeHex(code) {
   return walkStrings(code, b =>
     b.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) =>
@@ -91,6 +105,39 @@ function decodeStringChar(code) {
   return code;
 }
 
+function decodeBase64Strings(code) {
+  return walkStrings(code, b => {
+    if (b.length < 16 || b.length % 4 !== 0) return b;
+    if (!/^[A-Za-z0-9+/]+=*$/.test(b)) return b;
+    try {
+      const decoded = Buffer.from(b, 'base64').toString('utf-8');
+      if (printableScore(decoded) > 0.9 && decoded.length > 4) {
+        return escapeLua(decoded);
+      }
+    } catch {}
+    return b;
+  });
+}
+
+function bruteXorStrings(code) {
+  let count = 0;
+  const result = walkStrings(code, b => {
+    if (b.length < 20 || b.length > 5000) return b;
+    if (printableScore(b) > 0.9) return b; // already readable
+    let best = null;
+    for (let k = 1; k < 256; k++) {
+      const decoded = [...b].map(c => String.fromCharCode(c.charCodeAt(0) ^ k)).join('');
+      const score = printableScore(decoded);
+      if (score > 0.95 && /[a-zA-Z]{3,}/.test(decoded)) {
+        if (!best || score > best.score) best = { decoded, score, k };
+      }
+    }
+    if (best) { count++; return escapeLua(best.decoded); }
+    return b;
+  });
+  return { code: result, count };
+}
+
 function foldConcat(code) {
   let prev;
   do {
@@ -99,6 +146,100 @@ function foldConcat(code) {
       (_, a, b) => `"${a}${b}"`);
   } while (code !== prev);
   return code;
+}
+
+function foldArithmetic(code) {
+  let prev;
+  do {
+    prev = code;
+    code = code.replace(/\(\s*(-?\d+(?:\.\d+)?)\s*([+\-*/%])\s*(-?\d+(?:\.\d+)?)\s*\)/g,
+      (m, a, op, b) => {
+        const x = parseFloat(a), y = parseFloat(b); let r;
+        switch (op) {
+          case '+': r = x + y; break;
+          case '-': r = x - y; break;
+          case '*': r = x * y; break;
+          case '/': if (y === 0) return m; r = x / y; break;
+          case '%': if (y === 0) return m; r = ((x % y) + y) % y; break;
+        }
+        if (!isFinite(r)) return m;
+        return Number.isInteger(r) ? String(r) : r.toFixed(6).replace(/\.?0+$/, '');
+      });
+  } while (code !== prev);
+  return code;
+}
+
+function foldBit32(code) {
+  const ops = {
+    bxor: (a, b) => (a ^ b) >>> 0,
+    band: (a, b) => (a & b) >>> 0,
+    bor: (a, b) => (a | b) >>> 0,
+    bnot: a => (~a) >>> 0,
+    lshift: (a, b) => (a << b) >>> 0,
+    rshift: (a, b) => (a >>> b),
+  };
+  let prev;
+  do {
+    prev = code;
+    code = code.replace(/bit32\.(\w+)\s*\(([^()]+)\)/g, (m, op, args) => {
+      const fn = ops[op]; if (!fn) return m;
+      const parts = args.split(',').map(s => s.trim());
+      if (!parts.every(p => /^-?\d+$/.test(p))) return m;
+      try { return String(fn(...parts.map(p => parseInt(p, 10) >>> 0))); }
+      catch { return m; }
+    });
+  } while (code !== prev);
+  return code;
+}
+
+function resolveConstantTables(code) {
+  const tables = new Map();
+  const re = /local\s+(\w+)\s*=\s*\{([^{}]+)\}/g;
+  let m;
+  while ((m = re.exec(code)) !== null) {
+    const name = m[1];
+    const items = m[2].split(',').map(s => s.trim()).filter(Boolean);
+    if (items.length < 3) continue;
+    const lits = []; let ok = true;
+    for (const it of items) {
+      const sm = it.match(/^(["'])((?:\\.|(?!\1)[^\\])*)\1$/);
+      const nm = it.match(/^-?\d+(?:\.\d+)?$/);
+      if (sm) lits.push({ k: 's', v: sm[2], q: sm[1] });
+      else if (nm) lits.push({ k: 'n', v: it });
+      else { ok = false; break; }
+    }
+    if (ok && lits.length >= 3) tables.set(name, lits);
+  }
+  for (const [name, lits] of tables) {
+    const escName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    code = code.replace(new RegExp(`\\b${escName}\\s*\\[\\s*(\\d+)\\s*\\]`, 'g'), (full, idx) => {
+      const i = parseInt(idx, 10) - 1;
+      if (i < 0 || i >= lits.length) return full;
+      const l = lits[i];
+      return l.k === 's' ? `${l.q}${l.v}${l.q}` : l.v;
+    });
+  }
+  return code;
+}
+
+function unwrapLoadstrings(code, max = 8) {
+  let layers = 0;
+  for (let i = 0; i < max; i++) {
+    const m = code.match(/load(?:string)?\s*\(\s*(["'])([\s\S]+?)\1\s*\)\s*\(\s*\)/);
+    if (!m) break;
+    const inner = decodeHex(decodeDecimal(m[2]));
+    if (inner === m[2] || inner.length < 5) break;
+    code = code.replace(m[0], inner);
+    layers++;
+  }
+  return { code, layers };
+}
+
+function removeDeadCode(code) {
+  code = code.replace(/\bif\s+false\s+then\b[\s\S]*?\bend\b/g, '');
+  code = code.replace(/\bwhile\s+false\s+do\b[\s\S]*?\bend\b/g, '');
+  code = code.replace(/\bdo\s+end\b/g, '');
+  return code.replace(/\n{3,}/g, '\n\n');
 }
 
 function beautify(code) {
@@ -140,18 +281,58 @@ function beautify(code) {
   return result.join('\n') + '\n';
 }
 
-function decode(code) {
-  let prev, passes = 0;
+// ==================== FINGERPRINTING ====================
+
+function detectObfuscator(code) {
+  const hints = [];
+  if (/Luraph|LPH_/i.test(code)) hints.push('Luraph');
+  if (/Moonsec|MoonSec/i.test(code)) hints.push('Moonsec');
+  if (/Ironbrew|IronBrew/i.test(code)) hints.push('IronBrew');
+  if (/Prometheus/i.test(code)) hints.push('Prometheus');
+  if (/Wynfuscate/i.test(code)) hints.push('Wynfuscate');
+  if (/WeAreDevs/i.test(code)) hints.push('WeAreDevs');
+  if (/SynapseXen|Synapse Xen/i.test(code)) hints.push('Synapse Xen');
+  if (/\\x[0-9a-f]{2}/i.test(code) && code.length > 1000) hints.push('hex-encoded strings');
+  if (/string\.char\s*\(\s*\d+/.test(code)) hints.push('string.char encoding');
+  if (/load(?:string)?\s*\(\s*["']/.test(code)) hints.push('loadstring wrapper');
+  if (/bit32\.(bxor|band|bor)/.test(code)) hints.push('bitwise obfuscation');
+  return hints;
+}
+
+// ==================== PIPELINE ====================
+
+function decodeFull(code) {
+  const stats = { passes: 0, layers: 0, xorDecoded: 0, originalSize: code.length };
+  code = stripComments(code);
+
+  let prev;
   do {
     prev = code;
     code = decodeHex(code);
     code = decodeDecimal(code);
     code = decodeStringChar(code);
+    code = decodeBase64Strings(code);
     code = foldConcat(code);
-    passes++;
-  } while (code !== prev && passes < 5);
-  return code;
+    code = foldArithmetic(code);
+    code = foldBit32(code);
+    code = resolveConstantTables(code);
+    const unwrap = unwrapLoadstrings(code);
+    code = unwrap.code;
+    stats.layers += unwrap.layers;
+    stats.passes++;
+  } while (code !== prev && stats.passes < 10);
+
+  const xorResult = bruteXorStrings(code);
+  code = xorResult.code;
+  stats.xorDecoded = xorResult.count;
+
+  code = removeDeadCode(code);
+  code = beautify(code);
+  stats.finalSize = code.length;
+  return { code, stats };
 }
+
+// ==================== EXTRACTORS ====================
 
 function extractStrings(code) {
   const found = [];
@@ -172,6 +353,8 @@ function extractLoadstrings(code) {
   return out;
 }
 
+// ==================== SOURCE / OUTPUT ====================
+
 async function getSource(interaction) {
   const code = interaction.options.getString('code');
   const file = interaction.options.getAttachment('file');
@@ -179,7 +362,7 @@ async function getSource(interaction) {
 
   if (file) {
     if (!/\.(lua|luau|txt)$/i.test(file.name || '')) return { error: 'File must be .lua, .luau, or .txt' };
-    if (file.size > MAX_BYTES) return { error: `File too large (${(file.size/1024).toFixed(1)} KB)` };
+    if (file.size > MAX_BYTES) return { error: `File too large (${(file.size/1024/1024).toFixed(1)} MB, max ${MAX_BYTES/1024/1024} MB)` };
     try {
       const res = await fetch(file.url);
       if (!res.ok) return { error: `Fetch failed: ${res.status}` };
@@ -200,16 +383,18 @@ async function getSource(interaction) {
   return { error: 'Provide code, file, or url' };
 }
 
-async function sendOutput(interaction, content, filename) {
+async function sendOutput(interaction, content, filename, extra = '') {
   if (content.length <= MAX_INLINE) {
-    return interaction.editReply({ content: '```lua\n' + content + '\n```' });
+    return interaction.editReply({ content: extra + '```lua\n' + content + '\n```' });
   }
   const buf = Buffer.from(content, 'utf-8');
   return interaction.editReply({
-    content: `Output (${(buf.length/1024).toFixed(1)} KB)`,
+    content: extra + `Output (${(buf.length/1024).toFixed(1)} KB)`,
     files: [new AttachmentBuilder(buf, { name: filename })],
   });
 }
+
+// ==================== COMMANDS ====================
 
 const sourceOpts = b => b
   .addStringOption(o => o.setName('code').setDescription('Paste code').setRequired(false))
@@ -219,8 +404,9 @@ const sourceOpts = b => b
 const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show command list'),
   sourceOpts(new SlashCommandBuilder().setName('beautify').setDescription('Clean up Lua formatting')),
-  sourceOpts(new SlashCommandBuilder().setName('decode').setDescription('Decode escapes and fold concats')),
+  sourceOpts(new SlashCommandBuilder().setName('decode').setDescription('Full deobfuscation pipeline')),
   sourceOpts(new SlashCommandBuilder().setName('extract').setDescription('Extract strings, URLs, loadstrings')),
+  sourceOpts(new SlashCommandBuilder().setName('detect').setDescription('Identify obfuscator used')),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
@@ -237,71 +423,7 @@ async function registerCommands() {
   } catch (e) { console.error('Registration failed:', e); process.exit(1); }
 }
 
+// ==================== BOT ====================
+
 async function startBot() {
-  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-  client.once(Events.ClientReady, c => {
-    console.log(`Online as ${c.user.tag}`);
-    c.user.setActivity('/help', { type: 0 });
-  });
-
-  client.on(Events.InteractionCreate, async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-    const cmd = interaction.commandName;
-
-    try {
-      if (cmd === 'help') {
-        const embed = new EmbedBuilder()
-          .setColor(0x00ff88)
-          .setTitle('Commands')
-          .addFields(
-            { name: '/beautify', value: 'Clean up Lua formatting and indentation' },
-            { name: '/decode', value: 'Decode escapes, string.char, fold concats' },
-            { name: '/extract', value: 'Pull strings, URLs, and loadstring payloads' },
-          )
-          .setFooter({ text: 'Each command takes code, file, or url.' });
-        return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-      }
-
-      await interaction.deferReply();
-      const src = await getSource(interaction);
-      if (src.error) return interaction.editReply(src.error);
-
-      if (cmd === 'beautify') {
-        const out = beautify(stripComments(src.code));
-        return sendOutput(interaction, out, 'beautified.lua');
-      }
-      if (cmd === 'decode') {
-        const out = beautify(decode(stripComments(src.code)));
-        return sendOutput(interaction, out, 'decoded.lua');
-      }
-      if (cmd === 'extract') {
-        const stripped = stripComments(src.code);
-        const strings = extractStrings(stripped).slice(0, 200);
-        const urls = extractURLs(stripped);
-        const loads = extractLoadstrings(stripped);
-        const report =
-          `-- URLs (${urls.length}) --\n${urls.join('\n') || '(none)'}\n\n` +
-          `-- Loadstring payloads (${loads.length}) --\n${loads.map((l,i) => `[${i+1}] ${l.slice(0,200)}`).join('\n') || '(none)'}\n\n` +
-          `-- Strings (showing ${strings.length}) --\n${strings.map(s => JSON.stringify(s)).join('\n')}`;
-        return sendOutput(interaction, report, 'extract.txt');
-      }
-    } catch (err) {
-      console.error(err);
-      const msg = `Error: ${err.message}`;
-      if (interaction.deferred || interaction.replied) interaction.editReply(msg).catch(() => {});
-      else interaction.reply({ content: msg, flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
-  });
-
-  process.on('unhandledRejection', e => console.error('unhandled:', e));
-  process.on('uncaughtException',  e => console.error('uncaught:', e));
-
-  await client.login(DISCORD_TOKEN);
-}
-
-if (process.argv[2] === 'register') {
-  registerCommands();
-} else {
-  startBot();
-}
+  const client = new Client({ intents:
