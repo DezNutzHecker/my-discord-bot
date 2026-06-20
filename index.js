@@ -807,6 +807,7 @@ const commands = [
   sourceOpts(new SlashCommandBuilder().setName('extract').setDescription('Extract strings, URLs, loadstrings')),
   sourceOpts(new SlashCommandBuilder().setName('detect').setDescription('Identify obfuscator used')),
   sourceOpts(new SlashCommandBuilder().setName('sandbox').setDescription('Run script in sandboxed Lua and dump payloads')),
+  sourceOpts(new SlashCommandBuilder().setName('wad').setDescription('Unpack WeAreDevs obfuscator (fast, dedicated)')),
 ].map(c => c.toJSON());
 
 async function registerCommands() {
