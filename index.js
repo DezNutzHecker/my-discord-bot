@@ -817,14 +817,32 @@ function decodeFull(code) {
   const unwrap2 = unwrapLoadstrings(code);
   code = unwrap2.code; stats.layers += unwrap2.layers;
 
-  const rename = renameUglyIdentifiers(code);
-  code = rename.code; stats.renamed = rename.renamed;
+ function renameUglyIdentifiers(code) {
+  // First, find all existing identifiers so we don't collide
+  const existing = new Set();
+  const idRe = /\b([a-zA-Z_]\w*)\b/g;
+  let im;
+  while ((im = idRe.exec(code)) !== null) existing.add(im[1]);
 
-  code = removeDeadCode(code);
-  code = beautify(code);
-
-  stats.finalSize = code.length;
-  return { code, stats };
+  const seen = new Map();
+  let counter = 0;
+  const ugly = /\b(_0x[0-9a-fA-F]{4,}|_+[ilIO10]{4,}_*|[A-Z_]{12,})\b/g;
+  let m;
+  while ((m = ugly.exec(code)) !== null) {
+    const name = m[1];
+    if (LUA_KEYWORDS && LUA_KEYWORDS.has(name)) continue;
+    if (!seen.has(name)) {
+      let candidate;
+      do { candidate = `v${++counter}`; } while (existing.has(candidate));
+      seen.set(name, candidate);
+      existing.add(candidate);
+    }
+  }
+  const sorted = [...seen.keys()].sort((a, b) => b.length - a.length);
+  for (const k of sorted) {
+    code = code.replace(new RegExp(`\\b${escRe(k)}\\b`, 'g'), seen.get(k));
+  }
+  return { code, renamed: seen.size };
 }
 
 // ==================== EXTRACTORS ====================
