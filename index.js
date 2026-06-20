@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 require('dotenv').config();
 
 let fengari = null;
-try { fengari = require('fengari'); } catch { console.warn('fengari not installed — /sandbox disabled'); }
+try { fengari = require('fengari'); } catch { console.warn('fengari not installed - /sandbox disabled'); }
 
 const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
 if (!DISCORD_TOKEN || !CLIENT_ID) {
@@ -20,7 +20,6 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
 const MAX_BYTES = 8014 * 1024;
 const MAX_INLINE = 1900;
 const MAX_OUTPUT_FILE = 24 * 1024 * 1024;
-const STAGE_TIMEOUT_MS = 60_000;
 const SANDBOX_TIMEOUT_MS = 10_000;
 const CACHE_MAX = 200;
 const CACHE_TTL_MS = 30 * 60 * 1000;
@@ -105,15 +104,6 @@ function looksLikeLua(s) {
   return matches && matches.length >= 2;
 }
 
-function withTimeout(fn, ms, fallback) {
-  const start = Date.now();
-  try {
-    const r = fn();
-    if (Date.now() - start > ms) return fallback;
-    return r;
-  } catch { return fallback; }
-}
-
 // ==================== STRING DECODERS ====================
 
 function decodeHex(code) {
@@ -180,29 +170,12 @@ function bruteXorStrings(code) {
     if (b.length < 16 || b.length > 50000) return b;
     if (printableScore(b) > 0.9 && looksLikeLua(b)) return b;
     let best = null;
-    // 1-byte keys
     for (let k = 1; k < 256; k++) {
       let decoded = '';
       for (let i = 0; i < b.length; i++) decoded += String.fromCharCode(b.charCodeAt(i) ^ k);
       const score = printableScore(decoded);
       if (score > 0.95 && /[a-zA-Z]{3,}/.test(decoded)) {
         if (!best || score > best.score) best = { decoded, score };
-      }
-    }
-    // 2-byte keys (sample of common ones)
-    if (!best && b.length > 50) {
-      for (let k1 = 1; k1 < 256; k1 += 17) {
-        for (let k2 = 1; k2 < 256; k2 += 17) {
-          let decoded = '';
-          for (let i = 0; i < b.length; i++) {
-            const k = (i % 2 === 0) ? k1 : k2;
-            decoded += String.fromCharCode(b.charCodeAt(i) ^ k);
-          }
-          const score = printableScore(decoded);
-          if (score > 0.97 && looksLikeLua(decoded)) {
-            if (!best || score > best.score) best = { decoded, score };
-          }
-        }
       }
     }
     if (best) { count++; return escapeLua(best.decoded); }
@@ -247,7 +220,6 @@ function tryReverseStrings(code) {
   });
   return { code: result, count };
 }
-
 // ==================== FOLDING ====================
 
 function foldConcat(code) {
@@ -422,4 +394,404 @@ function beautify(code) {
     if (c === '"' || c === "'") { if (buf) { tokens.push({ s: false, v: buf }); buf = ''; } inStr = c; buf = c; i++; continue; }
     buf += c; i++;
   }
-  if (buf) t
+  if (buf) tokens.push({ s: !!inStr, v: buf });
+
+  let joined = '';
+  for (const t of tokens) {
+    if (t.s) joined += t.v;
+    else {
+      let v = t.v.replace(/;/g, '\n');
+      v = v.replace(/\b(then|do)\b/g, '$1\n');
+      v = v.replace(/\b(end|else|elseif|until)\b/g, '\n$1');
+      joined += v;
+    }
+  }
+
+  const lines = joined.split('\n').map(l => l.trim()).filter(Boolean);
+  const result = [];
+  let indent = 0;
+  for (const l of lines) {
+    if (/^(end|else|elseif|until)\b/.test(l)) indent = Math.max(0, indent - 1);
+    result.push('  '.repeat(indent) + l);
+    if (/\b(then|do|function[^)]*\)|repeat|else)\s*$/.test(l)) indent++;
+    if (/^(else|elseif)\b/.test(l)) indent++;
+  }
+  return result.join('\n') + '\n';
+}
+
+// ==================== FINGERPRINTING ====================
+
+function detectObfuscator(code) {
+  const hints = [];
+  if (/Luraph|LPH_|lph_/i.test(code)) hints.push('Luraph');
+  if (/Moonsec|MoonSec/i.test(code)) hints.push('Moonsec');
+  if (/Ironbrew|IronBrew/i.test(code)) hints.push('IronBrew');
+  if (/Prometheus/i.test(code)) hints.push('Prometheus');
+  if (/Wynfuscate/i.test(code)) hints.push('Wynfuscate');
+  if (/WeAreDevs/i.test(code)) hints.push('WeAreDevs');
+  if (/SynapseXen|Synapse\s*Xen/i.test(code)) hints.push('Synapse Xen');
+  if (/Hercules/i.test(code)) hints.push('Hercules');
+  if (/luaobfuscator\.com/i.test(code)) hints.push('LuaObfuscator.com');
+  if ((code.match(/\\x[0-9a-f]{2}/gi) || []).length > 20) hints.push('hex-encoded strings');
+  if ((code.match(/string\.char\s*\(\s*\d+/g) || []).length > 5) hints.push('string.char encoding');
+  if (/load(?:string)?\s*\(\s*["']/.test(code)) hints.push('loadstring wrapper');
+  if ((code.match(/bit32\.(bxor|band|bor)/g) || []).length > 5) hints.push('bitwise obfuscation');
+  if (/while\s+true\s+do[\s\S]{0,200}if\s+\w+\s*==\s*\d+\s+then/.test(code)) hints.push('VM-style dispatcher');
+  if ((code.match(/_0x[0-9a-f]{4,}/gi) || []).length > 10) hints.push('hex-mangled identifiers');
+  return hints;
+}
+
+// ==================== SANDBOX ====================
+
+function sandboxExecute(code) {
+  if (!fengari) return { available: false, captured: [], error: 'fengari not installed' };
+
+  const captured = [];
+  const { lua, lauxlib, lualib, to_luastring } = fengari;
+  const L = lauxlib.luaL_newstate();
+  lualib.luaL_openlibs(L);
+
+  // Replace dangerous globals
+  const noop = () => 0;
+
+  // Hook loadstring/load to capture payloads
+  const captureLoad = (L) => {
+    if (lua.lua_isstring(L, 1)) {
+      const s = lua.lua_tojsstring(L, 1);
+      if (s && s.length > 10) captured.push({ type: 'load', value: s });
+    }
+    lua.lua_pushnil(L);
+    return 1;
+  };
+
+  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('loadstring'));
+  lua.lua_pushjsfunction(L, captureLoad); lua.lua_setglobal(L, to_luastring('load'));
+
+  // Block dangerous stuff
+  const block = ['os', 'io', 'require', 'dofile', 'loadfile', 'package'];
+  for (const name of block) {
+    lua.lua_pushnil(L); lua.lua_setglobal(L, to_luastring(name));
+  }
+
+  // Capture print
+  lua.lua_pushjsfunction(L, (L) => {
+    const n = lua.lua_gettop(L);
+    const parts = [];
+    for (let i = 1; i <= n; i++) {
+      if (lua.lua_isstring(L, i)) parts.push(lua.lua_tojsstring(L, i));
+      else parts.push(String(lua.lua_tonumber(L, i)));
+    }
+    captured.push({ type: 'print', value: parts.join('\t') });
+    return 0;
+  });
+  lua.lua_setglobal(L, to_luastring('print'));
+
+  // Fake game env for Roblox scripts
+  const fakeGame = `
+    local mt = {__index = function(t,k) return setmetatable({}, getmetatable(t)) end,
+                __call = function(t, ...) return setmetatable({}, getmetatable(t)) end,
+                __newindex = function(t,k,v) end}
+    game = setmetatable({}, mt)
+    workspace = setmetatable({}, mt)
+    script = setmetatable({}, mt)
+    wait = function() end
+    spawn = function(f) end
+    delay = function(t,f) end
+    tick = function() return 0 end
+    Instance = setmetatable({new = function() return setmetatable({}, mt) end}, mt)
+  `;
+  lauxlib.luaL_dostring(L, to_luastring(fakeGame));
+
+  // Time-limit via instruction hook
+  const start = Date.now();
+  lua.lua_sethook(L, () => {
+    if (Date.now() - start > SANDBOX_TIMEOUT_MS) {
+      lauxlib.luaL_error(L, to_luastring('sandbox timeout'));
+    }
+  }, lua.LUA_MASKCOUNT, 10000);
+
+  try {
+    const status = lauxlib.luaL_dostring(L, to_luastring(code));
+    if (status !== lua.LUA_OK) {
+      const err = lua.lua_tojsstring(L, -1) || 'unknown error';
+      return { available: true, captured, error: err };
+    }
+    return { available: true, captured, error: null };
+  } catch (e) {
+    return { available: true, captured, error: e.message };
+  }
+}
+// ==================== PIPELINE ====================
+
+function decodeFull(code) {
+  const stats = {
+    originalSize: code.length, passes: 0, layers: 0,
+    xorDecoded: 0, caesarDecoded: 0, base64Decoded: 0,
+    reversedDecoded: 0, renamed: 0,
+  };
+
+  code = stripComments(code);
+
+  let prev;
+  do {
+    prev = code;
+    code = decodeHex(code);
+    code = decodeDecimal(code);
+    code = decodeUnicode(code);
+    code = decodeStringChar(code);
+
+    const b64 = decodeBase64Strings(code); code = b64.code; stats.base64Decoded += b64.count;
+
+    code = foldConcat(code);
+    code = foldArithmetic(code);
+    code = foldBit32(code);
+    code = resolveConstantTables(code);
+    code = inlineTrivialFunctions(code);
+
+    const unwrap = unwrapLoadstrings(code);
+    code = unwrap.code; stats.layers += unwrap.layers;
+
+    stats.passes++;
+  } while (code !== prev && stats.passes < 12);
+
+  const xorResult = bruteXorStrings(code);
+  code = xorResult.code; stats.xorDecoded = xorResult.count;
+
+  const caesarResult = bruteCaesarStrings(code);
+  code = caesarResult.code; stats.caesarDecoded = caesarResult.count;
+
+  const revResult = tryReverseStrings(code);
+  code = revResult.code; stats.reversedDecoded = revResult.count;
+
+  // One more sweep after brute decoders
+  code = foldConcat(code);
+  code = resolveConstantTables(code);
+  const unwrap2 = unwrapLoadstrings(code);
+  code = unwrap2.code; stats.layers += unwrap2.layers;
+
+  const rename = renameUglyIdentifiers(code);
+  code = rename.code; stats.renamed = rename.renamed;
+
+  code = removeDeadCode(code);
+  code = beautify(code);
+
+  stats.finalSize = code.length;
+  return { code, stats };
+}
+
+// ==================== EXTRACTORS ====================
+
+function extractStrings(code) {
+  const found = [];
+  walkStrings(code, b => { if (b.length >= 4) found.push(b); return b; });
+  return [...new Set(found)];
+}
+
+function extractURLs(code) {
+  const re = /https?:\/\/[^\s"'<>)]+/gi;
+  return [...new Set(code.match(re) || [])];
+}
+
+function extractLoadstrings(code) {
+  const out = [];
+  const re = /load(?:string)?\s*\(\s*(["'])([\s\S]+?)\1\s*\)/g;
+  let m;
+  while ((m = re.exec(code)) !== null) out.push(m[2]);
+  return out;
+}
+
+// ==================== SOURCE / OUTPUT ====================
+
+async function getSource(interaction) {
+  const code = interaction.options.getString('code');
+  const file = interaction.options.getAttachment('file');
+  const url = interaction.options.getString('url');
+
+  if (file) {
+    if (!/\.(lua|luau|txt)$/i.test(file.name || '')) return { error: 'File must be .lua, .luau, or .txt' };
+    if (file.size > MAX_BYTES) return { error: `File too large (${(file.size/1024/1024).toFixed(2)} MB, max ${(MAX_BYTES/1024/1024).toFixed(2)} MB)` };
+    try {
+      const res = await fetch(file.url);
+      if (!res.ok) return { error: `Fetch failed: ${res.status}` };
+      return { code: await res.text() };
+    } catch (e) { return { error: `Attachment fetch failed: ${e.message}` }; }
+  }
+  if (url) {
+    if (!/^https?:\/\//i.test(url)) return { error: 'URL must start with http(s)://' };
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) return { error: `URL fetch failed: ${res.status}` };
+      const text = await res.text();
+      if (Buffer.byteLength(text) > MAX_BYTES) return { error: 'Fetched content too large' };
+      return { code: text };
+    } catch (e) { return { error: `URL fetch failed: ${e.message}` }; }
+  }
+  if (code) return { code: code.replace(/\\n/g, '\n').replace(/\\t/g, '\t') };
+  return { error: 'Provide code, file, or url' };
+}
+
+async function sendOutput(interaction, content, filename, extra = '') {
+  if (content.length <= MAX_INLINE) {
+    return interaction.editReply({ content: extra + '```lua\n' + content + '\n```' });
+  }
+  const buf = Buffer.from(content, 'utf-8');
+  if (buf.length > MAX_OUTPUT_FILE) {
+    return interaction.editReply({ content: extra + `Output too large to send (${(buf.length/1024/1024).toFixed(1)} MB, Discord cap is 25 MB).` });
+  }
+  return interaction.editReply({
+    content: extra + `Output (${(buf.length/1024).toFixed(1)} KB)`,
+    files: [new AttachmentBuilder(buf, { name: filename })],
+  });
+}
+
+// ==================== COMMANDS ====================
+
+const sourceOpts = b => b
+  .addStringOption(o => o.setName('code').setDescription('Paste code').setRequired(false))
+  .addAttachmentOption(o => o.setName('file').setDescription('Upload .lua/.luau/.txt').setRequired(false))
+  .addStringOption(o => o.setName('url').setDescription('Raw URL').setRequired(false));
+
+const commands = [
+  new SlashCommandBuilder().setName('help').setDescription('Show command list'),
+  sourceOpts(new SlashCommandBuilder().setName('beautify').setDescription('Clean up Lua formatting')),
+  sourceOpts(new SlashCommandBuilder().setName('decode').setDescription('Full deobfuscation pipeline')),
+  sourceOpts(new SlashCommandBuilder().setName('extract').setDescription('Extract strings, URLs, loadstrings')),
+  sourceOpts(new SlashCommandBuilder().setName('detect').setDescription('Identify obfuscator used')),
+  sourceOpts(new SlashCommandBuilder().setName('sandbox').setDescription('Run script in sandboxed Lua and dump payloads')),
+].map(c => c.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  try {
+    if (GUILD_ID) {
+      console.log(`Registering ${commands.length} commands to guild ${GUILD_ID}...`);
+      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    } else {
+      console.log(`Registering ${commands.length} commands globally...`);
+      await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    }
+    console.log('Commands registered.');
+  } catch (e) { console.error('Registration failed:', e); process.exit(1); }
+}
+
+// ==================== BOT ====================
+
+async function startBot() {
+  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+  client.once(Events.ClientReady, c => {
+    console.log(`Online as ${c.user.tag}`);
+    c.user.setActivity('/help', { type: 0 });
+  });
+
+  client.on(Events.InteractionCreate, async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+    const cmd = interaction.commandName;
+
+    try {
+      if (cmd === 'help') {
+        const embed = new EmbedBuilder()
+          .setColor(0x00ff88)
+          .setTitle('Commands')
+          .addFields(
+            { name: '/beautify', value: 'Clean up Lua formatting and indentation' },
+            { name: '/decode', value: 'Full deobfuscation: escapes, base64, XOR, Caesar, constant tables, loadstring unwrap, identifier rename, dead code, beautify' },
+            { name: '/extract', value: 'Pull strings, URLs, and loadstring payloads' },
+            { name: '/detect', value: 'Identify which obfuscator was used' },
+            { name: '/sandbox', value: 'Run the script in a sandboxed Lua VM and capture loadstring/print payloads' },
+          )
+          .setFooter({ text: `Max input: ${(MAX_BYTES/1024/1024).toFixed(2)} MB. Each command accepts code, file, or url.` });
+        return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+      }
+
+      await interaction.deferReply();
+      const src = await getSource(interaction);
+      if (src.error) return interaction.editReply(src.error);
+
+      const key = hashOf(cmd + ':' + src.code);
+      const cached = cache.get(key);
+
+      if (cmd === 'beautify') {
+        let out;
+        if (cached) out = cached;
+        else { out = beautify(stripComments(src.code)); cache.set(key, out); }
+        return sendOutput(interaction, out, 'beautified.lua', cached ? '(cached) ' : '');
+      }
+
+      if (cmd === 'decode') {
+        let result;
+        if (cached) result = cached;
+        else {
+          const start = Date.now();
+          const r = decodeFull(src.code);
+          r.stats.elapsedMs = Date.now() - start;
+          result = r;
+          cache.set(key, result);
+        }
+        const s = result.stats;
+        const header =
+          `-- Passes: ${s.passes} | Layers peeled: ${s.layers} | Strings: XOR=${s.xorDecoded} Caesar=${s.caesarDecoded} B64=${s.base64Decoded} Rev=${s.reversedDecoded} | Renamed: ${s.renamed}\n` +
+          `-- Size: ${(s.originalSize/1024).toFixed(1)} KB -> ${(s.finalSize/1024).toFixed(1)} KB | ${cached ? '(cached)' : (s.elapsedMs + 'ms')}\n\n`;
+        return sendOutput(interaction, header + result.code, 'decoded.lua');
+      }
+
+      if (cmd === 'extract') {
+        let report;
+        if (cached) report = cached;
+        else {
+          const stripped = stripComments(src.code);
+          const strings = extractStrings(stripped).slice(0, 500);
+          const urls = extractURLs(stripped);
+          const loads = extractLoadstrings(stripped);
+          report =
+            `-- URLs (${urls.length}) --\n${urls.join('\n') || '(none)'}\n\n` +
+            `-- Loadstring payloads (${loads.length}) --\n${loads.map((l,i) => `[${i+1}] ${l.slice(0,300)}`).join('\n') || '(none)'}\n\n` +
+            `-- Strings (${strings.length}) --\n${strings.map(s => JSON.stringify(s)).join('\n')}`;
+          cache.set(key, report);
+        }
+        return sendOutput(interaction, report, 'extract.txt');
+      }
+
+      if (cmd === 'detect') {
+        const hints = detectObfuscator(src.code);
+        const report = hints.length
+          ? `Detected indicators:\n  - ${hints.join('\n  - ')}`
+          : 'No known obfuscator signatures found.';
+        return interaction.editReply('```\n' + report + '\n```');
+      }
+
+      if (cmd === 'sandbox') {
+        const result = sandboxExecute(src.code);
+        if (!result.available) return interaction.editReply('Sandbox unavailable: ' + result.error);
+        const lines = [];
+        lines.push(`-- Captured ${result.captured.length} event(s)`);
+        if (result.error) lines.push(`-- Error: ${result.error}`);
+        lines.push('');
+        for (const e of result.captured) {
+          lines.push(`-- [${e.type}] (${e.value.length} chars)`);
+          lines.push(e.value);
+          lines.push('');
+        }
+        return sendOutput(interaction, lines.join('\n'), 'sandbox.lua');
+      }
+    } catch (err) {
+      console.error(err);
+      const msg = `Error: ${err.message}`;
+      if (interaction.deferred || interaction.replied) interaction.editReply(msg).catch(() => {});
+      else interaction.reply({ content: msg, flags: MessageFlags.Ephemeral }).catch(() => {});
+    }
+  });
+
+  process.on('unhandledRejection', e => console.error('unhandled:', e));
+  process.on('uncaughtException',  e => console.error('uncaught:', e));
+
+  await client.login(DISCORD_TOKEN);
+}
+
+// ==================== ENTRY ====================
+
+if (process.argv[2] === 'register') {
+  registerCommands();
+} else {
+  startBot();
+}
